@@ -12,8 +12,10 @@ microgpt_ref
 # Generated files
 weights.json
 
-# Dataset (too large for git, download separately)
-input.txt
+# Dataset in project root (download separately)
+/input.txt
+# But include the copy in ocaml/ for easy onboarding
+!ocaml/input.txt
 
 # Editor / IDE
 .vscode/
