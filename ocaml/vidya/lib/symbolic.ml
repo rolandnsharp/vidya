@@ -6,9 +6,10 @@
    (what's allowed). No retraining needed — just logit manipulation
    at inference time.
 
-   Two constraints applied in sequence:
+   Three constraints applied in sequence:
    1. Repetition penalty: penalize recently generated tokens
-   2. Word validation: mask out tokens that would form invalid words
+   2. Word boundary: when a complete word is formed, require a boundary next
+   3. Word validation: mask out tokens that would form invalid words
 
    Core principle from PLAN.md:
      "the neural model ranks by likelihood,
@@ -121,11 +122,39 @@ let repetition_penalty logits recent_tokens penalty =
   ) recent_tokens;
   biased
 
-(* ── Constraint 2: Word validation ────────────────────────────────── *)
+(* ── Constraint 2: Word boundary ──────────────────────────────────── *)
 
-(* Extract the "word part" from a candidate string — the portion after
-   the last word boundary, lowercased. If the string ends with a boundary,
-   also check the word completed before it. *)
+(* Penalty applied when the partial word is already a complete valid word
+   but the next token doesn't start with a word boundary. This prevents
+   "is" + "in" → "isin" by strongly preferring "is" + " " → "is ".
+   Uses a penalty (not neg_infinity) so it's a soft preference — if the
+   model is very confident about a continuation, it can still override. *)
+let boundary_penalty = 5.0
+
+let word_boundary_bias logits vocab partial_word valid_words =
+  if String.length partial_word = 0 then logits  (* at word start — no constraint *)
+  else if not (Hashtbl.mem valid_words (String.lowercase_ascii partial_word)) then logits
+  else begin
+    (* partial_word is a complete valid word. Penalize tokens that don't
+       start with a word boundary — they'd extend it into a non-word. *)
+    let biased = Array.copy logits in
+    let n = Array.length logits in
+    for tok_id = 0 to n - 1 do
+      if biased.(tok_id) > neg_infinity then begin
+        let tok_str = vocab.(tok_id) in
+        if String.length tok_str > 0
+           && not (is_word_boundary tok_str.[0]) then
+          biased.(tok_id) <- biased.(tok_id) -. boundary_penalty
+      end
+    done;
+    biased
+  end
+
+(* ── Constraint 3: Word validation ────────────────────────────────── *)
+
+(* Check whether a token would produce a valid word or valid prefix.
+   Tokens that cross a word boundary must complete a valid word before it.
+   Tokens extending a partial word must keep it a valid prefix. *)
 let word_validation logits vocab partial_word valid_words valid_prefixes =
   let biased = Array.copy logits in
   let n = Array.length logits in
@@ -178,6 +207,8 @@ let word_validation logits vocab partial_word valid_words valid_prefixes =
    Returns biased logits. Does NOT modify the original array. *)
 let apply ctx logits =
   let biased = repetition_penalty logits ctx.recent_tokens rep_penalty in
+  let biased = word_boundary_bias biased ctx.know.vocab ctx.partial_word
+    ctx.know.valid_words in
   let biased = word_validation biased ctx.know.vocab ctx.partial_word
     ctx.know.valid_words ctx.know.valid_prefixes in
   (* Safety: if all logits are neg_infinity, fall back to just rep penalty
