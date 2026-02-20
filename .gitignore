@@ -10,6 +10,7 @@ ocaml/microgpt_tensor
 ocaml/microgpt_optimized
 ocaml/microgpt_modern
 ocaml/microgpt_rope
+ocaml/microgpt_scaled
 *.exe
 *.o
 *.cmo
