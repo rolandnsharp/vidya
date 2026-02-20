@@ -23,8 +23,9 @@
 #include <caml/memory.h>
 #include <cblas.h>
 
-/* Limit OpenBLAS to 1 thread — at 64×64 matrices, thread overhead
- * exceeds the benefit of parallelism. Single-threaded is faster. */
+/* Pin OpenBLAS to 1 thread. Even at 128×128 matrices, thread
+ * synchronization overhead (19x slower!) far exceeds any benefit.
+ * Multi-threading only helps at much larger matrices (512×512+). */
 extern void openblas_set_num_threads(int);
 __attribute__((constructor))
 static void init_blas(void) { openblas_set_num_threads(1); }

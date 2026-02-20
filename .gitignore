@@ -14,6 +14,7 @@ ocaml/microgpt_scaled
 ocaml/microgpt_blas
 ocaml/microgpt_batched
 ocaml/microgpt_fullblas
+ocaml/microgpt_bpe
 *.exe
 *.o
 *.cmo
