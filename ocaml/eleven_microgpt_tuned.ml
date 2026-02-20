@@ -1240,7 +1240,10 @@ let () =
   Printf.printf "num params: %d\n" total_params;
 
   if Array.length Sys.argv > 1 && Sys.argv.(1) = "--load" then begin
-    (* Load saved weights — skip training entirely *)
+    (* Load saved weights — skip training entirely.
+       Re-seed RNG from clock so each run gives different samples
+       (training mode uses seed 42 for reproducibility). *)
+    Random.self_init ();
     load_checkpoint checkpoint_file params;
     Printf.printf "skipping training (loaded from %s)\n%!" checkpoint_file
   end else begin

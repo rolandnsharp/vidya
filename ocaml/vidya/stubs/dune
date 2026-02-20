@@ -1,0 +1,9 @@
+(library
+ (name vidya_stubs)
+ (foreign_stubs (language c) (names blas_stubs)
+  (flags (:include c_flags.sexp)))
+ (c_library_flags -lopenblas))
+
+(rule
+ (targets c_flags.sexp)
+ (action (write-file c_flags.sexp "(-I/usr/include/x86_64-linux-gnu)")))

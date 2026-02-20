@@ -1,0 +1,3 @@
+(library
+ (name vidya)
+ (libraries vidya_stubs))
