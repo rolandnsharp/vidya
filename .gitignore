@@ -1,0 +1,24 @@
+# Compiled binaries
+microgpt_mutable
+microgpt_ref
+*.exe
+*.o
+*.cmo
+*.cmi
+*.cmx
+*.cma
+*.cmxa
+
+# Generated files
+weights.json
+
+# Dataset (too large for git, download separately)
+input.txt
+
+# Editor / IDE
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
