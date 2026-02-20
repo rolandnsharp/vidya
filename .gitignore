@@ -8,6 +8,8 @@ ocaml/microgpt_ref
 ocaml/microgpt_bare
 ocaml/microgpt_tensor
 ocaml/microgpt_optimized
+ocaml/microgpt_modern
+ocaml/microgpt_rope
 *.exe
 *.o
 *.cmo
