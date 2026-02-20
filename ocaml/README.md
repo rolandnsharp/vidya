@@ -8,10 +8,10 @@ This is **Stage 1** of the [Vidya](../PLAN.md) project — a faithful translatio
 
 ```bash
 cd ocaml
-ocamlopt -o microgpt_mutable microgpt_mutable.ml
+ocamlopt -o microgpt_mutable 1_microgpt_mutable.ml
 ./microgpt_mutable
 
-ocamlopt -o microgpt_ref microgpt_ref.ml
+ocamlopt -o microgpt_ref 1_microgpt_ref.ml
 ./microgpt_ref
 ```
 
@@ -23,7 +23,7 @@ Both versions train on `input.txt` (included) and generate text samples after 10
 
 We implemented the same algorithm twice to compare two OCaml approaches to mutable state.
 
-### `microgpt_mutable.ml` — Mutable Record Fields
+### `1_microgpt_mutable.ml` — Mutable Record Fields
 
 The autograd `value` type uses OCaml's `mutable` keyword:
 
@@ -41,7 +41,7 @@ type value = {
 
 **Best for:** Reading and understanding the algorithm. Direct mapping to the original code. Familiar to anyone from an imperative background.
 
-### `microgpt_ref.ml` — Ref Cells + Functional Style
+### `1_microgpt_ref.ml` — Ref Cells + Functional Style
 
 The autograd `value` type uses `float ref` (mutable containers):
 
@@ -173,7 +173,7 @@ These files are heavily commented with OCaml syntax explanations aimed at develo
 - **`Array.fold_left f init arr`:** Like `arr.reduce(f, init)` in TS.
 - **Pattern matching:** Like `switch` but exhaustive — the compiler warns if you miss a case.
 
-See the "OCaml Survival Guide" comment block at the top of `microgpt_mutable.ml` for a full reference.
+See the "OCaml Survival Guide" comment block at the top of `1_microgpt_mutable.ml` for a full reference.
 
 ## Architecture
 

@@ -1,8 +1,12 @@
 # Compiled binaries
 microgpt_mutable
 microgpt_ref
+microgpt_bare
+microgpt_tensor
 ocaml/microgpt_mutable
 ocaml/microgpt_ref
+ocaml/microgpt_bare
+ocaml/microgpt_tensor
 *.exe
 *.o
 *.cmo
