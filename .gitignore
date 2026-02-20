@@ -1,6 +1,8 @@
 # Compiled binaries
 microgpt_mutable
 microgpt_ref
+ocaml/microgpt_mutable
+ocaml/microgpt_ref
 *.exe
 *.o
 *.cmo
