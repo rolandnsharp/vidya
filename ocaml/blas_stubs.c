@@ -1,48 +1,33 @@
-/* blas_stubs.c — Minimal C glue between OCaml and OpenBLAS.
+/* blas_stubs.c — OCaml ↔ OpenBLAS bridge (Stage 7+)
  *
- * This file provides exactly ONE function: a wrapper around cblas_dgemm
- * (double-precision general matrix multiply). Everything else in the
- * project stays pure OCaml.
+ * Single C function wrapping cblas_dgemm with 6 operation modes,
+ * encoded as a 3-bit flag:
  *
- * WHY WE NEED THIS
- * =================
- * OCaml's ocamlopt compiler generates good scalar code but cannot emit
- * SIMD instructions (AVX2/AVX-512). For matrix multiplication — the
- * dominant cost in transformer training — OpenBLAS uses hand-tuned
- * assembly kernels that exploit SIMD, cache blocking, and micro-
- * architecture-specific optimizations. At 64x64 matrices this gives
- * ~5-10x speedup; at 256+ dimensions, ~20-50x.
+ *   bit 2 (4): transpose A
+ *   bit 1 (2): transpose B
+ *   bit 0 (1): accumulate (beta=1) vs overwrite (beta=0)
  *
- * HOW OCAML C FFI WORKS
- * =====================
- * OCaml float arrays are stored as flat, contiguous, unboxed doubles
- * in the heap. The value pointer points directly to the first double
- * (after the block header). So (double *)Op_val(v) gives us a raw
- * double* that BLAS can use directly — no copying needed.
+ *   op=0: C[m,n]  = A[m,k]  @ B[k,n]      NN overwrite
+ *   op=1: C[m,n] += A[m,k]  @ B[k,n]      NN accumulate
+ *   op=2: C[m,n]  = A[m,k]  @ B^T[k,n]    NT overwrite  (B stored [n,k])
+ *   op=3: C[m,n] += A[m,k]  @ B^T[k,n]    NT accumulate
+ *   op=4: C[m,n]  = A^T[m,k] @ B[k,n]     TN overwrite  (A stored [k,m])
+ *   op=5: C[m,n] += A^T[m,k] @ B[k,n]     TN accumulate
  *
- * The GC won't move these arrays during our cblas_dgemm call because
- * the GC only runs when OCaml code allocates, and cblas_dgemm doesn't
- * allocate on the OCaml heap.
+ * m,n are always the result dimensions. k is the contracted dimension.
  *
- * OPERATIONS
- * ==========
- * We encode three matrix multiply variants in a single function via
- * an 'op' flag, keeping the OCaml external interface simple:
- *
- *   op=0 (forward):     C[m,n]  = A[m,k] @ B[k,n]     beta=0 (overwrite)
- *   op=1 (backward da): C[m,k] += A[m,n] @ B[k,n]^T   beta=1 (accumulate)
- *   op=2 (backward db): C[k,n] += A[m,k]^T @ B[m,n]   beta=1 (accumulate)
- *
- * The m,n,k dimensions always match the original forward pass, so the
- * caller doesn't need to think about transposition.
- *
- * Compile: ocamlopt -O2 -o microgpt_blas blas_stubs.c 6_microgpt_blas.ml \
- *          -ccopt "-I/usr/include/x86_64-linux-gnu" -cclib -lopenblas
+ * Compile with: -ccopt "-I/usr/include/x86_64-linux-gnu" -cclib -lopenblas
  */
 
 #include <caml/mlvalues.h>
 #include <caml/memory.h>
 #include <cblas.h>
+
+/* Limit OpenBLAS to 1 thread — at 64×64 matrices, thread overhead
+ * exceeds the benefit of parallelism. Single-threaded is faster. */
+extern void openblas_set_num_threads(int);
+__attribute__((constructor))
+static void init_blas(void) { openblas_set_num_threads(1); }
 
 CAMLprim value caml_dgemm(value vop, value vm, value vn, value vk,
                           value va, value vb, value vc) {
@@ -50,45 +35,27 @@ CAMLprim value caml_dgemm(value vop, value vm, value vn, value vk,
     int m  = Int_val(vm);
     int n  = Int_val(vn);
     int k  = Int_val(vk);
-
-    /* OCaml float array -> raw double pointer.
-     * Op_val(v) returns (value*)(v), which for float arrays points
-     * to the first double in the contiguous unboxed storage. */
     double *a = (double *)Op_val(va);
     double *b = (double *)Op_val(vb);
     double *c = (double *)Op_val(vc);
 
-    switch (op) {
-    case 0:
-        /* Forward: C[m,n] = A[m,k] @ B[k,n]
-         * Row-major: lda=k, ldb=n, ldc=n */
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    m, n, k, 1.0, a, k, b, n, 0.0, c, n);
-        break;
+    CBLAS_TRANSPOSE ta = (op & 4) ? CblasTrans : CblasNoTrans;
+    CBLAS_TRANSPOSE tb = (op & 2) ? CblasTrans : CblasNoTrans;
+    double beta        = (op & 1) ? 1.0 : 0.0;
 
-    case 1:
-        /* Backward da: C[m,k] += A[m,n] @ B[k,n]^T
-         * A=dC[m,n], B=original_B[k,n], C=da[m,k]
-         * BLAS: dgemm(N, T, m, k, n, 1.0, dC, n, B, n, 1.0, da, k) */
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    m, k, n, 1.0, a, n, b, n, 1.0, c, k);
-        break;
+    /* Row-major leading dimensions:
+     *   NoTrans: matrix stored [rows, cols], ld = cols
+     *   Trans:   matrix stored [cols, rows], ld = rows
+     * A logical [m,k]: stored [m,k] if N (ld=k), [k,m] if T (ld=m)
+     * B logical [k,n]: stored [k,n] if N (ld=n), [n,k] if T (ld=k) */
+    int lda = (op & 4) ? m : k;
+    int ldb = (op & 2) ? k : n;
 
-    case 2:
-        /* Backward db: C[k,n] += A[m,k]^T @ B[m,n]
-         * A=original_A[m,k], B=dC[m,n], C=db[k,n]
-         * BLAS: dgemm(T, N, k, n, m, 1.0, A, k, dC, n, 1.0, db, n) */
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                    k, n, m, 1.0, a, k, b, n, 1.0, c, n);
-        break;
-    }
-
+    cblas_dgemm(CblasRowMajor, ta, tb, m, n, k,
+                1.0, a, lda, b, ldb, beta, c, n);
     return Val_unit;
 }
 
-/* Bytecode wrapper: OCaml bytecode can only pass ≤5 args directly to C.
- * For 6+ args, it passes an argv array instead. We only compile with
- * ocamlopt (native), but include this for completeness / portability. */
 CAMLprim value caml_dgemm_byte(value *argv, int argn) {
     (void)argn;
     return caml_dgemm(argv[0], argv[1], argv[2], argv[3],
