@@ -7,6 +7,7 @@ ocaml/microgpt_mutable
 ocaml/microgpt_ref
 ocaml/microgpt_bare
 ocaml/microgpt_tensor
+ocaml/microgpt_optimized
 *.exe
 *.o
 *.cmo
