@@ -11,6 +11,7 @@ ocaml/microgpt_optimized
 ocaml/microgpt_modern
 ocaml/microgpt_rope
 ocaml/microgpt_scaled
+ocaml/microgpt_blas
 *.exe
 *.o
 *.cmo
