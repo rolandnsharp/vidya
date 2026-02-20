@@ -43,6 +43,9 @@ let () =
     Vidya.Train.save_checkpoint checkpoint_file params
   end;
 
+  (* Build symbolic knowledge once — shared across all generations *)
+  let know = Vidya.Symbolic.build tok.vocab docs tok.bos_id in
+
   (* Check for --prompt "text" in argv *)
   let prompt_text = ref "" in
   for i = 1 to Array.length Sys.argv - 2 do
@@ -53,13 +56,13 @@ let () =
     Printf.printf "--- prompted generation ---\n";
     Printf.printf "prompt: %s\n" !prompt_text;
     for i = 1 to 10 do
-      Vidya.Generate.prompted model docs tok.vocab tok tok.bos_id !prompt_text 0.5
+      Vidya.Generate.prompted model know tok tok.bos_id !prompt_text 0.5
       |> Printf.printf "  %2d: %s\n" i
     done
   end else begin
     Printf.printf "--- inference (new, hallucinated text) ---\n";
     for i = 1 to 20 do
-      Vidya.Generate.sample model docs tok.vocab tok.bos_id 0.5
+      Vidya.Generate.sample model know tok.bos_id 0.5
       |> Printf.printf "sample %2d: %s\n" i
     done
   end;
