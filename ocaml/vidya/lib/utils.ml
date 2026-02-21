@@ -2,10 +2,30 @@
    =====================================
 
    Small helpers used across multiple modules:
+   - is_word_boundary / strip_word: word boundary detection and stripping
    - random_gauss: Box-Muller normal distribution sampling
    - shuffle: Fisher-Yates in-place array shuffle
    - weighted_choice: sample from a probability distribution
    - load_docs: read a text file into an array of non-empty lines *)
+
+(* Characters treated as word boundaries.
+   Used by both symbolic.ml (word validation) and knowledge.ml
+   (concept extraction) to ensure consistent word segmentation. *)
+let is_word_boundary ch =
+  ch = ' ' || ch = '\n' || ch = '\t' || ch = '\r'
+  || ch = ',' || ch = '.' || ch = ';' || ch = ':'
+  || ch = '!' || ch = '?' || ch = '"' || ch = '\''
+  || ch = '(' || ch = ')' || ch = '[' || ch = ']'
+  || ch = '-' || ch = '/' || ch = '\\'
+
+(* Strip leading and trailing punctuation/whitespace from a word. *)
+let strip_word w =
+  let n = String.length w in
+  let i = ref 0 in
+  while !i < n && is_word_boundary w.[!i] do incr i done;
+  let j = ref (n - 1) in
+  while !j >= !i && is_word_boundary w.[!j] do decr j done;
+  if !i > !j then "" else String.sub w !i (!j - !i + 1)
 
 (* Box-Muller transform: generate a sample from N(mean, std²).
    Rejection-samples until we get a valid unit disk point, then

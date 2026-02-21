@@ -2,21 +2,21 @@
    ====================================================================
 
    Adam with cosine LR schedule, warmup, and gradient clipping.
-   Higher peak LR (0.003) stretched over 100K steps so the model
-   keeps learning well past the halfway point. Gradient clipping
-   at norm 1.0 prevents the higher LR from exploding.
+   Lower peak LR (0.001) stretched over 200K steps for the 10M
+   param model. Longer warmup (2000 steps) for stability.
+   Gradient clipping at norm 1.0 prevents explosions.
 
    Running average loss over 2500-step windows shows the real trend
    (per-doc loss bounces 2.4-4.6 depending on doc difficulty). *)
 
 type adam_state = { m : float array; v : float array }
 
-let learning_rate = 0.003
-let beta1 = 0.85
-let beta2 = 0.99
+let learning_rate = 0.001
+let beta1 = 0.9
+let beta2 = 0.999
 let eps_adam = 1e-8
 let max_grad_norm = 1.0
-let warmup_steps = 400
+let warmup_steps = 2000
 
 let init_adam params =
   let total = Array.fold_left (fun acc p -> acc + Array.length p.Tensor.data) 0 params in
