@@ -7,16 +7,16 @@
    3. chat: format user input with turn markers, generate response
 
    All take a Symbolic.knowledge (built once, shared across runs)
-   and an optional Knowledge.t (Forth-based concept knowledge).
+   and an optional Knowledge.t (concept knowledge).
    A fresh Symbolic.context is created per generation call.
    Constraints are applied to logits before sampling. *)
 
 (* sample: Generate text from scratch (starting from BOS).
    Feeds BOS, then autoregressively samples until BOS is produced
    again or block_size is reached. *)
-let sample model know ?forth_know bos_id temperature =
+let sample model know ?concept_know bos_id temperature =
   Tensor.training := false;
-  let sym_ctx = Symbolic.create ?forth_know know in
+  let sym_ctx = Symbolic.create ?concept_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
   let token_id = ref bos_id in
   let buf = Buffer.create 256 in
@@ -40,9 +40,9 @@ let sample model know ?forth_know bos_id temperature =
 (* prompted: Encode a prompt via BPE, prefill the KV cache with
    prompt tokens (no sampling during prefill), then sample
    continuation tokens autoregressively with symbolic constraints. *)
-let prompted model know ?forth_know tok bos_id prompt temperature =
+let prompted model know ?concept_know tok bos_id prompt temperature =
   Tensor.training := false;
-  let sym_ctx = Symbolic.create ?forth_know know in
+  let sym_ctx = Symbolic.create ?concept_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
   let prompt_ids = Bpe.encode tok prompt in
   let vocab = know.Symbolic.vocab in
@@ -80,9 +80,9 @@ let prompted model know ?forth_know tok bos_id prompt temperature =
 (* chat: Format user input as a chat turn, generate assistant response.
    Encodes "<|user|> {input} <|assistant|>" as the prompt, prefills
    the KV cache, then samples until <|user|> or BOS is produced. *)
-let chat model know ?forth_know tok user_input temperature =
+let chat model know ?concept_know tok user_input temperature =
   Tensor.training := false;
-  let sym_ctx = Symbolic.create ?forth_know know in
+  let sym_ctx = Symbolic.create ?concept_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
   let prompt = Printf.sprintf "<|user|> %s <|assistant|>" user_input in
   let prompt_ids = Bpe.encode tok prompt in

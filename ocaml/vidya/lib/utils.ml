@@ -9,7 +9,7 @@
    - load_docs: read a text file into an array of non-empty lines *)
 
 (* Characters treated as word boundaries.
-   Used by both symbolic.ml (word validation) and knowledge.ml
+   Used by symbolic.ml (word validation) and knowledge.ml
    (concept extraction) to ensure consistent word segmentation. *)
 let is_word_boundary ch =
   ch = ' ' || ch = '\n' || ch = '\t' || ch = '\r'

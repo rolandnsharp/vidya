@@ -6,50 +6,53 @@
 
 ## Completed
 
-### ~~1. Expand BPE vocab from 500 to 2000 merges~~ ✓
-Done. `n_merges = 2000` in `lib/bpe.ml`. Vocab goes from ~580 → ~2100 tokens.
-New checkpoint file (`_v2`) since old one is incompatible. Expect ~4-5 chars/token
-(was ~2.8) and slightly higher param count (~9.98M vs 9.59M).
+### ~~1. Expand BPE vocab from 500 to 2000 merges~~ done
+`n_merges = 2000` in `lib/bpe.ml`. Vocab goes from ~580 to ~2100 tokens.
 
-### ~~2. Learnable RMSNorm + final norm~~ ✓
-RMSNorm was already in use (pre-norm pattern). Added learnable γ scale vectors
-to all norm positions (`rmsnorm_affine` / `batch_rmsnorm_affine` in tensor.ml).
-Added `ln1`/`ln2` per layer, `embed_norm`, and `final_norm` before lm_head.
-+6,400 params (25 × 256), initialized to 1.0. Checkpoint bumped to `_v3`.
+### ~~2. Learnable RMSNorm + final norm~~ done
+Added learnable gamma scale vectors to all norm positions. Added `final_norm`
+before lm_head. +6,400 params, initialized to 1.0.
 
-## Up Next (while training runs)
+### ~~3. More and better training data~~ done
+Grew from 16K to 37K conversations (24MB). Cleaned existing data, added 25K
+from SODA (Allen AI) + 576 new DailyDialog lines.
 
-### ~~3. More and better training data~~ ✓
-Grew from 16K → 37K conversations (24MB, up from 7MB). Cleaned existing data
-(removed 4,276 duplicates + 77 trivial lines), added 25K from SODA (Allen AI)
-+ 576 new DailyDialog lines. Avg turn depth improved (more 3-5 turn convos),
-avg line length up from 465 → 676 chars. Backup at `chat_input_backup.txt`.
+### ~~4. Dropout~~ done
+`batch_dropout` in `tensor.ml` (p=0.1, inverted scaling). Applied after
+attention projection, after MLP output, and after embedding norm in training.
 
-### ~~4. Dropout~~ ✓
-Added `batch_dropout` to `tensor.ml` (p=0.1, inverted scaling, autograd-aware).
-Applied after attention projection, after MLP output, and after embedding norm
-in the training forward pass. Training flag `Tensor.training` toggles on/off —
-set true in `train.ml`, false in `generate.ml`. No new params, no checkpoint change.
-KV cache already exists for inference — nothing to add there.
+### ~~5. Remove Forth interpreter, keep symbolic ideas~~ done
+Deleted `forth.ml`. Rewrote `knowledge.ml` to use plain OCaml hashtables
+instead of a Forth dictionary. Symbolic constrained decoding preserved —
+concept coherence, TD learning, word validation all work the same way,
+just without the Forth runtime underneath.
 
-## After current training finishes
+## Up Next
 
-### 5. Check loss curve, decide next run
-If loss is still dropping at 200K steps, consider extending to 500K-1M. But by
-then RMSNorm will be ready, so it may be better to retrain with the new arch
-instead of continuing the old one. Evaluate.
+### 6. Check loss curve, retrain v3 on CPU
+When v1 finishes: evaluate loss curve, then retrain with v3 arch (new vocab +
+learnable norms + 37K data + dropout). This is the last CPU-only run.
 
-### 6. Scale to 50-100M params
-512 dim, 16-24 layers. CPU-trainable but takes days. Where coherent sentences
-emerge consistently.
+### 7. Get a GPU (RTX 3090)
+Used RTX 3090 on eBay AU: ~AU $1,000-1,350 for 24GB VRAM. This is the gate
+to everything that follows — 100M param training drops from 3+ days to hours.
 
-### 7. Strengthen the symbolic layer
-Expand Forth dictionary, add concept relationships, tune TD reward signal.
-Only valuable once base model produces semi-coherent text.
+### 8. CUDA backend
+Port matmul and key ops to CUDA kernels. The tensor.ml autograd stays in OCaml,
+just the inner BLAS calls get replaced with GPU equivalents.
+
+### 9. Scale to 100M params
+32 layers, 512 dim, 16 heads (~102M params). First model that should produce
+consistently coherent sentences. Train on GPU — hours not days.
+
+### 10. Tune symbolic layer at scale
+Once the base model is coherent at 100M params, the constrained decoding
+becomes genuinely useful. Tune the concept coherence, topic depth, and TD
+learning parameters against the fluent base model. The symbolic layer steers
+output that's already good, rather than fighting output that's uncertain.
 
 ## Notes
-- Vocab + data quality are the biggest levers at this scale
-- A 10M model with 2K vocab + 50K clean docs beats a 50M model with 580 vocab + 16K docs
 - Binary checkpoints are architecture-specific — dimension changes require retrain
 - 10M v1 training is running now (200K steps, ~8hrs) — don't retrain until it finishes
-- When it does: evaluate loss curve, then retrain with new vocab + learnable norms + bigger dataset
+- GPU is the critical path — everything after step 9 depends on it
+- Forth is gone from the codebase; the symbolic ideas live on in pure OCaml

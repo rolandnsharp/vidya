@@ -10,7 +10,7 @@
                                          → load + interactive chat mode
 
    BPE training always runs first (fast, ~3s, deterministic from corpus).
-   Symbolic + Forth knowledge built once, shared across all generations.
+   Symbolic + concept knowledge built once, shared across all generations.
    The checkpoint format is unchanged from the monolithic stage files. *)
 
 let () = Random.init 42
@@ -63,9 +63,9 @@ let () =
   let know = Vidya.Symbolic.build tok.vocab docs tok.bos_id
     ~special_ids () in
 
-  (* Build Forth-based concept knowledge — dictionary + associations *)
-  let forth_know = Vidya.Knowledge.build tok.vocab docs tok.bos_id in
-  Vidya.Knowledge.load_weights "td_weights.bin" forth_know.dict;
+  (* Build concept knowledge — co-occurrence associations *)
+  let concept_know = Vidya.Knowledge.build tok.vocab docs tok.bos_id in
+  Vidya.Knowledge.load_weights "td_weights.bin" concept_know;
 
   let prompt_text = get_flag_value "--prompt" in
 
@@ -82,7 +82,7 @@ let () =
         if trimmed = "quit" || trimmed = "exit" then
           running := false
         else begin
-          let response = Vidya.Generate.chat model know ~forth_know:forth_know
+          let response = Vidya.Generate.chat model know ~concept_know
             tok trimmed 0.5 in
           Printf.printf "%s\n%!" response
         end
@@ -91,17 +91,17 @@ let () =
     Printf.printf "--- prompted generation ---\n";
     Printf.printf "prompt: %s\n" prompt_text;
     for i = 1 to 10 do
-      Vidya.Generate.prompted model know ~forth_know:forth_know
+      Vidya.Generate.prompted model know ~concept_know
         tok tok.bos_id prompt_text 0.5
       |> Printf.printf "  %2d: %s\n" i
     done
   end else begin
     Printf.printf "--- inference (new, hallucinated text) ---\n";
     for i = 1 to 20 do
-      Vidya.Generate.sample model know ~forth_know:forth_know
+      Vidya.Generate.sample model know ~concept_know
         tok.bos_id 0.5
       |> Printf.printf "sample %2d: %s\n" i
     done
   end;
-  Vidya.Knowledge.save_weights "td_weights.bin" forth_know.dict;
+  Vidya.Knowledge.save_weights "td_weights.bin" concept_know;
   Printf.printf "total time: %.2fs\n" (Sys.time () -. t_start)

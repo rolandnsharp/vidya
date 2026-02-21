@@ -13,7 +13,7 @@
    4. Concept coherence: boost tokens associated with active concepts
    5. Topic depth: penalize over-concentration on a single topic
 
-   Core principle from PLAN.md:
+   Core principle:
      "the neural model ranks by likelihood,
       the symbolic system defines what's valid."
 
@@ -27,9 +27,6 @@ let recent_size = 32
 (* Penalty subtracted from logits of recently seen tokens *)
 let rep_penalty = 1.5
 
-(* Word boundary detection and stripping now live in Utils
-   to avoid a dependency cycle with Knowledge.
-   Local aliases for readability. *)
 let is_word_boundary = Utils.is_word_boundary
 let strip_word = Utils.strip_word
 
@@ -40,17 +37,13 @@ type knowledge = {
   valid_prefixes : (string, unit) Hashtbl.t;
   vocab : string array;
   bos_id : int;
-  special_ids : int list;  (* token IDs exempt from word constraints *)
+  special_ids : int list;
 }
 
-(* build: Extract all words from the corpus, strip punctuation,
-   lowercase, and build valid_words + valid_prefixes sets.
-   Called once at startup — the sets are shared across all generations. *)
 let build vocab docs bos_id ?(special_ids = []) () =
   let valid_words = Hashtbl.create 4096 in
   let valid_prefixes = Hashtbl.create 16384 in
   Array.iter (fun doc ->
-    (* Split on whitespace *)
     let words = String.split_on_char ' ' doc in
     List.iter (fun raw ->
       let w = strip_word (String.lowercase_ascii raw) in
@@ -80,7 +73,7 @@ type contribution = {
 
 type context = {
   know : knowledge;
-  forth_know : Knowledge.t option;
+  concept_know : Knowledge.t option;
   recent_tokens : int array;
   mutable pos : int;
   mutable partial_word : string;
@@ -90,12 +83,9 @@ type context = {
   mutable td_baseline : float;
 }
 
-(* create: Fresh context for one generation run.
-   Reuses the static knowledge; only allocates the ring buffer.
-   forth_know is optional — if None, concept constraints are skipped. *)
-let create ?forth_know know =
+let create ?concept_know know =
   { know;
-    forth_know;
+    concept_know;
     recent_tokens = Array.make recent_size (-1);
     pos = 0;
     partial_word = "";
@@ -105,14 +95,9 @@ let create ?forth_know know =
     td_baseline = 0.0;
   }
 
-(* record_token: Add a generated token to the ring buffer and update
-   the partial word tracker and active concepts. Call this after
-   sampling each token. Punctuation and whitespace reset the partial
-   word — matching the stripping done during knowledge building. *)
 let record_token ctx token_id =
   ctx.recent_tokens.(ctx.pos) <- token_id;
   ctx.pos <- (ctx.pos + 1) mod recent_size;
-  (* Special tokens reset partial word — they're structural markers *)
   if List.mem token_id ctx.know.special_ids then
     ctx.partial_word <- ""
   else if token_id >= 0 && token_id < Array.length ctx.know.vocab then begin
@@ -124,16 +109,13 @@ let record_token ctx token_id =
         ctx.partial_word <- ctx.partial_word ^ String.make 1 ch
     ) tok_str
   end;
-  (* Update active concepts from Forth knowledge *)
-  match ctx.forth_know with
+  match ctx.concept_know with
   | None -> ()
   | Some knowledge ->
-    (* Age all active concepts, remove stale ones (age > 16) *)
     ctx.active_concepts <-
       List.filter_map (fun (c, age) ->
         if age < 16 then Some (c, age + 1) else None
       ) ctx.active_concepts;
-    (* Check if this token activates any concepts *)
     (match Hashtbl.find_opt knowledge.Knowledge.token_to_concepts token_id with
      | None -> ()
      | Some concepts ->
@@ -156,19 +138,12 @@ let repetition_penalty logits recent_tokens penalty =
 
 (* ── Constraint 2: Word boundary ──────────────────────────────────── *)
 
-(* Penalty applied when the partial word is already a complete valid word
-   but the next token doesn't start with a word boundary. This prevents
-   "is" + "in" → "isin" by strongly preferring "is" + " " → "is ".
-   Uses a penalty (not neg_infinity) so it's a soft preference — if the
-   model is very confident about a continuation, it can still override. *)
 let boundary_penalty = 5.0
 
 let word_boundary_bias logits vocab partial_word valid_words =
-  if String.length partial_word = 0 then logits  (* at word start — no constraint *)
+  if String.length partial_word = 0 then logits
   else if not (Hashtbl.mem valid_words (String.lowercase_ascii partial_word)) then logits
   else begin
-    (* partial_word is a complete valid word. Penalize tokens that don't
-       start with a word boundary — they'd extend it into a non-word. *)
     let biased = Array.copy logits in
     let n = Array.length logits in
     for tok_id = 0 to n - 1 do
@@ -184,9 +159,6 @@ let word_boundary_bias logits vocab partial_word valid_words =
 
 (* ── Constraint 3: Word validation ────────────────────────────────── *)
 
-(* Check whether a token would produce a valid word or valid prefix.
-   Tokens that cross a word boundary must complete a valid word before it.
-   Tokens extending a partial word must keep it a valid prefix. *)
 let word_validation logits vocab partial_word valid_words valid_prefixes =
   let biased = Array.copy logits in
   let n = Array.length logits in
@@ -196,14 +168,11 @@ let word_validation logits vocab partial_word valid_words valid_prefixes =
       let candidate = String.lowercase_ascii (partial_word ^ tok_str) in
       let clen = String.length candidate in
       if clen > 0 then begin
-        (* Find the last word boundary in the candidate *)
         let last_boundary = ref (-1) in
         String.iteri (fun i ch ->
           if is_word_boundary ch then last_boundary := i
         ) candidate;
         if !last_boundary >= 0 then begin
-          (* Token contains or crosses a word boundary.
-             Check the completed word (text between previous boundary and this one). *)
           let word_start = ref 0 in
           for i = 0 to !last_boundary - 1 do
             if is_word_boundary candidate.[i] then
@@ -214,7 +183,6 @@ let word_validation logits vocab partial_word valid_words valid_prefixes =
           if String.length completed_word > 0
              && not (Hashtbl.mem valid_words completed_word) then
             biased.(tok_id) <- neg_infinity;
-          (* Also check the trailing partial after the last boundary *)
           if biased.(tok_id) > neg_infinity && !last_boundary < clen - 1 then begin
             let trailing = String.sub candidate (!last_boundary + 1)
               (clen - !last_boundary - 1) in
@@ -224,8 +192,6 @@ let word_validation logits vocab partial_word valid_words valid_prefixes =
               biased.(tok_id) <- neg_infinity
           end
         end else begin
-          (* No boundary — entire candidate is a partial word.
-             Must be a valid prefix or complete word. *)
           if not (Hashtbl.mem valid_prefixes candidate)
              && not (Hashtbl.mem valid_words candidate) then
             biased.(tok_id) <- neg_infinity
@@ -237,13 +203,6 @@ let word_validation logits vocab partial_word valid_words valid_prefixes =
 
 (* ── Constraint 4: Concept coherence ─────────────────────────────── *)
 
-(* When recent tokens have activated concepts, boost logits for tokens
-   that map to associated concepts. This encourages topically connected
-   generation — if "soul" was recently generated, tokens related to
-   "body", "mind", "nature" get a boost.
-
-   Uses soft biases (never neg_infinity) so the neural model always
-   has the final say on token selection. *)
 let coherence_decay = 0.85
 
 let concept_coherence ctx logits active_concepts knowledge =
@@ -252,10 +211,10 @@ let concept_coherence ctx logits active_concepts knowledge =
     let biased = Array.copy logits in
     List.iter (fun (concept_name, age) ->
       let decay = coherence_decay ** float_of_int age in
-      let assocs = Forth.associations knowledge.Knowledge.dict concept_name in
+      let assocs = Knowledge.associations knowledge concept_name in
       List.iter (fun (assoc_name, weight) ->
         let boost = weight *. decay in
-        if boost > 0.01 then begin  (* skip negligible boosts *)
+        if boost > 0.01 then begin
           match Hashtbl.find_opt knowledge.Knowledge.concept_to_tokens assoc_name with
           | None -> ()
           | Some token_ids ->
@@ -274,11 +233,6 @@ let concept_coherence ctx logits active_concepts knowledge =
 
 (* ── Constraint 5: Topic depth penalty ──────────────────────────── *)
 
-(* If the same concepts keep being activated, gently penalize to
-   encourage topic evolution. Prevents getting stuck repeating the
-   same cluster of related concepts over and over.
-
-   Only kicks in after max_topic_depth consecutive activations. *)
 let max_topic_depth = 4
 let depth_penalty = 0.5
 
@@ -307,39 +261,25 @@ let topic_depth_penalty logits topic_counts knowledge =
 
 (* ── Apply all constraints ──────────────────────────────────────── *)
 
-(* apply: Apply all symbolic constraints to logits before sampling.
-   Returns biased logits. Does NOT modify the original array.
-   Constraints 1-3 are always active. Constraints 4-5 are only
-   active when Forth knowledge is available. *)
 let apply ctx logits =
-  (* Clear contributions from previous step *)
   ctx.contributions <- [];
-  (* Constraint 1: Repetition penalty *)
   let biased = repetition_penalty logits ctx.recent_tokens rep_penalty in
-  (* Save special token logits — exempt them from word constraints *)
   let special_saved =
     List.map (fun id -> (id, biased.(id))) ctx.know.special_ids in
-  (* Constraint 2: Word boundary bias *)
   let biased = word_boundary_bias biased ctx.know.vocab ctx.partial_word
     ctx.know.valid_words in
-  (* Constraint 3: Word validation *)
   let biased = word_validation biased ctx.know.vocab ctx.partial_word
     ctx.know.valid_words ctx.know.valid_prefixes in
-  (* Restore special token logits — they're structural, not words *)
   List.iter (fun (id, v) ->
     if id >= 0 && id < Array.length biased then
       biased.(id) <- v
   ) special_saved;
-  (* Constraints 4-5: Concept coherence + topic depth (Forth-based) *)
-  let biased = match ctx.forth_know with
+  let biased = match ctx.concept_know with
     | None -> biased
     | Some knowledge ->
       let biased = concept_coherence ctx biased ctx.active_concepts knowledge in
       topic_depth_penalty biased ctx.topic_counts knowledge
   in
-  (* Safety: if all logits are neg_infinity, fall back to just rep penalty
-     to avoid a degenerate softmax. This can happen if the model is
-     mid-word and no valid continuation exists in the vocabulary. *)
   let all_neg_inf = Array.for_all (fun x -> x = neg_infinity) biased in
   if all_neg_inf then
     repetition_penalty logits ctx.recent_tokens rep_penalty
@@ -348,11 +288,6 @@ let apply ctx logits =
 
 (* ── TD learning update ──────────────────────────────────────────── *)
 
-(* TD model of classical conditioning: concept activation is the
-   conditioned stimulus, neural confidence (raw logit for chosen token)
-   is the unconditioned stimulus. Associations that predict high-confidence
-   tokens get stronger, irrelevant ones weaken. *)
-
 let td_alpha = 0.005
 let td_max_weight = 5.0
 let td_baseline_decay = 0.99
@@ -360,7 +295,7 @@ let td_verbose = try ignore (Sys.getenv "VIDYA_TD_VERBOSE"); true
                  with Not_found -> false
 
 let td_update ctx raw_logits chosen_token =
-  match ctx.forth_know with
+  match ctx.concept_know with
   | None -> ()
   | Some knowledge ->
     if ctx.contributions = [] then ()
@@ -377,7 +312,7 @@ let td_update ctx raw_logits chosen_token =
         let new_weight = contrib.weight +. td_alpha *. delta *. contrib.decay in
         let clamped = Float.max 0.0 (Float.min td_max_weight new_weight) in
         if clamped <> contrib.weight then begin
-          Forth.update_association_weight knowledge.Knowledge.dict
+          Knowledge.update_association_weight knowledge
             contrib.concept_name contrib.assoc_name clamped;
           if td_verbose then
             Printf.printf "  td: %s->%s %.3f->%.3f\n%!"
