@@ -172,16 +172,18 @@ let batch_fused_attention q k v seq_len =
 let batch_transformer_block x layer seq_len =
   let n_embd = Model.n_embd in
   let m = n_embd and n = n_embd in
-  let xn = Tensor.batch_rmsnorm x seq_len n_embd in
+  let xn = Tensor.batch_rmsnorm_affine x layer.Model.ln1 seq_len n_embd in
   let q = Tensor.batch_matmul layer.Model.attn_wq xn seq_len m n in
   let k = Tensor.batch_matmul layer.Model.attn_wk xn seq_len m n in
   let v = Tensor.batch_matmul layer.Model.attn_wv xn seq_len m n in
   let attn_out = batch_fused_attention q k v seq_len in
   let attn_proj = Tensor.batch_matmul layer.Model.attn_wo attn_out seq_len m n in
+  let attn_proj = Tensor.batch_dropout attn_proj seq_len n_embd in
   let x = Tensor.add x attn_proj in
-  let xn = Tensor.batch_rmsnorm x seq_len n_embd in
+  let xn = Tensor.batch_rmsnorm_affine x layer.Model.ln2 seq_len n_embd in
   let mlp_h = Tensor.batch_matmul layer.Model.mlp_fc1 xn seq_len (4 * n_embd) n_embd |> Tensor.gelu in
   let mlp_out = Tensor.batch_matmul layer.Model.mlp_fc2 mlp_h seq_len n_embd (4 * n_embd) in
+  let mlp_out = Tensor.batch_dropout mlp_out seq_len n_embd in
   Tensor.add x mlp_out
 
 (* gpt_forward_batch: Full training forward pass over a token sequence.
@@ -189,10 +191,12 @@ let batch_transformer_block x layer seq_len =
 let gpt_forward_batch model tokens seq_len =
   let n_embd = Model.n_embd in
   let x = Tensor.batch_embed model.Model.wte tokens n_embd in
-  let x = Tensor.batch_rmsnorm x seq_len n_embd in
+  let x = Tensor.batch_rmsnorm_affine x model.Model.embed_norm seq_len n_embd in
+  let x = Tensor.batch_dropout x seq_len n_embd in
   let x = Array.fold_left (fun x layer ->
     batch_transformer_block x layer seq_len
   ) x model.Model.layers in
+  let x = Tensor.batch_rmsnorm_affine x model.Model.final_norm seq_len n_embd in
   let vocab_size = model.Model.wte.Tensor.shape.(0) in
   Tensor.batch_matmul model.Model.lm_head x seq_len vocab_size n_embd
 
@@ -200,7 +204,8 @@ let gpt_forward_batch model tokens seq_len =
 
 let embed_token model token_id =
   let n_embd = Model.n_embd in
-  Tensor.row model.Model.wte token_id |> fun x -> Tensor.rmsnorm x n_embd
+  Tensor.row model.Model.wte token_id
+  |> fun x -> Tensor.rmsnorm_affine x model.Model.embed_norm n_embd
 
 (* Single-token multi-head attention with KV cache.
    Appends current K,V to cache; attends over full history. *)
@@ -286,9 +291,10 @@ let mlp_block x layer =
 let transformer_block x layer kv =
   let n_embd = Model.n_embd in
   let x =
-    Tensor.rmsnorm x n_embd |> fun xn ->
+    Tensor.rmsnorm_affine x layer.Model.ln1 n_embd |> fun xn ->
     fused_multi_head_attention xn layer kv |> Tensor.add x in
-  Tensor.rmsnorm x n_embd |> fun xn -> mlp_block xn layer |> Tensor.add x
+  Tensor.rmsnorm_affine x layer.Model.ln2 n_embd |> fun xn ->
+    mlp_block xn layer |> Tensor.add x
 
 (* gpt_forward: Single-token inference with KV cache.
    Returns logits [vocab_size]. *)
@@ -299,5 +305,6 @@ let gpt_forward model token_id kv_caches =
     |> List.mapi (fun li layer -> (li, layer))
     |> List.fold_left (fun x (li, layer) ->
       transformer_block x layer kv_caches.(li)) x in
+  let x = Tensor.rmsnorm_affine x model.Model.final_norm n_embd in
   let vocab_size = model.Model.wte.Tensor.shape.(0) in
   Tensor.matmul model.Model.lm_head x vocab_size n_embd

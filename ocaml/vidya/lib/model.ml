@@ -36,6 +36,8 @@ type layer_weights = {
   attn_wq : Tensor.value; attn_wk : Tensor.value;
   attn_wv : Tensor.value; attn_wo : Tensor.value;
   mlp_fc1 : Tensor.value; mlp_fc2 : Tensor.value;
+  ln1 : Tensor.value;  (* pre-attention RMSNorm scale *)
+  ln2 : Tensor.value;  (* pre-MLP RMSNorm scale *)
 }
 
 type kv_cache = {
@@ -58,11 +60,16 @@ type t = {
   wte : Tensor.value;
   lm_head : Tensor.value;
   layers : layer_weights array;
+  embed_norm : Tensor.value;  (* post-embed RMSNorm scale *)
+  final_norm : Tensor.value;  (* pre-lm_head RMSNorm scale *)
 }
 
 let init_matrix ?(std = 0.08) nout nin =
   let data = Array.init (nout * nin) (fun _ -> Utils.random_gauss ~std ()) in
   Tensor.make_param [|nout; nin|] data
+
+let init_ones dim =
+  Tensor.make_param [|dim|] (Array.make dim 1.0)
 
 (* init: Create a fresh model with random weights.
    Weight tying: lm_head = wte (same tensor, shared gradients).
@@ -70,6 +77,8 @@ let init_matrix ?(std = 0.08) nout nin =
 let init vocab_size =
   let wte = init_matrix vocab_size n_embd in
   let lm_head = wte in
+  let embed_norm = init_ones n_embd in
+  let final_norm = init_ones n_embd in
   let residual_std = 0.08 /. sqrt (float_of_int (2 * n_layer)) in
   let make_layer () =
     let attn_wq = init_matrix n_embd n_embd in
@@ -78,19 +87,23 @@ let init vocab_size =
     let attn_wo = init_matrix ~std:residual_std n_embd n_embd in
     let mlp_fc1 = init_matrix (4 * n_embd) n_embd in
     let mlp_fc2 = init_matrix ~std:residual_std n_embd (4 * n_embd) in
-    { attn_wq; attn_wk; attn_wv; attn_wo; mlp_fc1; mlp_fc2 }
+    let ln1 = init_ones n_embd in
+    let ln2 = init_ones n_embd in
+    { attn_wq; attn_wk; attn_wv; attn_wo; mlp_fc1; mlp_fc2; ln1; ln2 }
   in
   let layers = Array.init n_layer (fun _ -> make_layer ()) in
-  { wte; lm_head; layers }
+  { wte; lm_head; layers; embed_norm; final_norm }
 
 (* collect_params: Gather all unique parameter tensors in a fixed order.
    Only includes wte once (lm_head is weight-tied to wte).
    Order: wte, then per-layer [wq, wk, wv, wo, fc1, fc2]. *)
 let collect_params model =
   let layer_params l =
-    [l.attn_wq; l.attn_wk; l.attn_wv; l.attn_wo; l.mlp_fc1; l.mlp_fc2] in
-  [model.wte]
+    [l.attn_wq; l.attn_wk; l.attn_wv; l.attn_wo; l.mlp_fc1; l.mlp_fc2;
+     l.ln1; l.ln2] in
+  [model.wte; model.embed_norm]
   @ (model.layers |> Array.to_list |> List.map layer_params |> List.flatten)
+  @ [model.final_norm]
   |> Array.of_list
 
 (* ── Head extraction / insertion helpers ──────────────────────────── *)

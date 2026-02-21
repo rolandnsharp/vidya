@@ -33,7 +33,7 @@ let get_flag_value flag =
 
 let () =
   let t_start = Sys.time () in
-  let checkpoint_file = "../../microgpt_chat_10m.bin" in
+  let checkpoint_file = "../../microgpt_chat_10m_v3.bin" in
   let input_file = "../../chat_input.txt" in
 
   (* BPE is always needed (fast, ~3s) — deterministic from corpus *)

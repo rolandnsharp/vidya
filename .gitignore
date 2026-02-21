@@ -27,9 +27,13 @@ ocaml/microgpt_tuned.bin
 
 # Generated files
 weights.json
+*.bin
 
-# Dataset in project root (download separately)
+# Dataset intermediates (keep chat_input.txt, ignore staging files)
 /input.txt
+chat_input_backup.txt
+chat_input_clean.txt
+chat_input_deduped.txt
 # But include the copy in ocaml/ for easy onboarding
 !ocaml/input.txt
 

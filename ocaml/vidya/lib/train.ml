@@ -71,6 +71,7 @@ let adam_step params adam step num_steps =
 
 (* Compute NLL loss for one document. *)
 let compute_loss model tokens =
+  Tensor.training := true;
   let seq_len = min Model.block_size (Array.length tokens - 1) in
   let input_tokens = Array.sub tokens 0 seq_len in
   let logits = Forward.gpt_forward_batch model input_tokens seq_len in

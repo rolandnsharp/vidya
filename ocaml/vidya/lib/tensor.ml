@@ -13,6 +13,10 @@
 let next_id = ref 0
 let fresh_id () = let id = !next_id in incr next_id; id
 
+(* Training mode flag — dropout is active only when true *)
+let training = ref true
+let dropout_rate = 0.1
+
 type value = {
   id : int;
   data : float array;
@@ -175,6 +179,37 @@ let rmsnorm x dim =
   { id = fresh_id (); data = y_data; grad = y_grad;
     shape = [|dim|]; children = [|x|]; backward_fn = backward }
 
+(* rmsnorm_affine: normalize then scale by learnable gamma.
+   Forward: y_i = (x_i / rms) * gamma_i
+   Backward: dg_i += dy_i * (x_i / rms), dx via chain rule *)
+let rmsnorm_affine x gamma dim =
+  let nf = float_of_int dim in
+  let ms = ref 0.0 in
+  for i = 0 to dim - 1 do ms := !ms +. x.data.(i) *. x.data.(i) done;
+  let rms = sqrt (!ms /. nf +. 1e-5) in
+  let norm_data = Array.create_float dim in
+  let y_data = Array.create_float dim in
+  for i = 0 to dim - 1 do
+    let ni = x.data.(i) /. rms in
+    norm_data.(i) <- ni;
+    y_data.(i) <- ni *. gamma.data.(i)
+  done;
+  let y_grad = Array.make dim 0.0 in
+  let backward () =
+    let dot = ref 0.0 in
+    for i = 0 to dim - 1 do
+      let dn_i = y_grad.(i) *. gamma.data.(i) in
+      dot := !dot +. dn_i *. norm_data.(i)
+    done;
+    let mean_dot = !dot /. nf in
+    for i = 0 to dim - 1 do
+      gamma.grad.(i) <- gamma.grad.(i) +. y_grad.(i) *. norm_data.(i);
+      let dn_i = y_grad.(i) *. gamma.data.(i) in
+      x.grad.(i) <- x.grad.(i) +. (dn_i -. norm_data.(i) *. mean_dot) /. rms
+    done in
+  { id = fresh_id (); data = y_data; grad = y_grad;
+    shape = [|dim|]; children = [|x; gamma|]; backward_fn = backward }
+
 (* ── Batched ops (training) ───────────────────────────────────────── *)
 
 (* batch_matmul: w[m,n] @ x[s,n]^T → y[s,m].
@@ -226,6 +261,76 @@ let batch_rmsnorm x s dim =
   in
   { id = fresh_id (); data = y_data; grad = y_grad;
     shape = [|s; dim|]; children = [|x|]; backward_fn = backward }
+
+(* batch_rmsnorm_affine: per-row normalize then scale by shared gamma. *)
+let batch_rmsnorm_affine x gamma s dim =
+  let dimf = float_of_int dim in
+  let y_data = Array.create_float (s * dim) in
+  let norm_data = Array.create_float (s * dim) in
+  let rms_vals = Array.create_float s in
+  for i = 0 to s - 1 do
+    let off = i * dim in
+    let ms = ref 0.0 in
+    for j = 0 to dim - 1 do
+      let v = x.data.(off + j) in
+      ms := !ms +. v *. v
+    done;
+    let rms = sqrt (!ms /. dimf +. 1e-5) in
+    rms_vals.(i) <- rms;
+    for j = 0 to dim - 1 do
+      let ni = x.data.(off + j) /. rms in
+      norm_data.(off + j) <- ni;
+      y_data.(off + j) <- ni *. gamma.data.(j)
+    done
+  done;
+  let y_grad = Array.make (s * dim) 0.0 in
+  let backward () =
+    for i = 0 to s - 1 do
+      let off = i * dim in
+      let rms = rms_vals.(i) in
+      let dot = ref 0.0 in
+      for j = 0 to dim - 1 do
+        let dn_j = y_grad.(off + j) *. gamma.data.(j) in
+        dot := !dot +. dn_j *. norm_data.(off + j)
+      done;
+      let mean_dot = !dot /. dimf in
+      for j = 0 to dim - 1 do
+        gamma.grad.(j) <- gamma.grad.(j) +. y_grad.(off + j) *. norm_data.(off + j);
+        let dn_j = y_grad.(off + j) *. gamma.data.(j) in
+        x.grad.(off + j) <- x.grad.(off + j)
+          +. (dn_j -. norm_data.(off + j) *. mean_dot) /. rms
+      done
+    done
+  in
+  { id = fresh_id (); data = y_data; grad = y_grad;
+    shape = [|s; dim|]; children = [|x; gamma|]; backward_fn = backward }
+
+(* batch_dropout: randomly zero elements during training, scale survivors.
+   No-op when training = false. Mask stored for backward. *)
+let batch_dropout x s dim =
+  if not !training || dropout_rate = 0.0 then x
+  else begin
+    let n = s * dim in
+    let scale = 1.0 /. (1.0 -. dropout_rate) in
+    let mask = Array.create_float n in
+    let y_data = Array.create_float n in
+    for i = 0 to n - 1 do
+      if Random.float 1.0 >= dropout_rate then begin
+        mask.(i) <- scale;
+        y_data.(i) <- x.data.(i) *. scale
+      end else begin
+        mask.(i) <- 0.0;
+        y_data.(i) <- 0.0
+      end
+    done;
+    let y_grad = Array.make n 0.0 in
+    let backward () =
+      for i = 0 to n - 1 do
+        x.grad.(i) <- x.grad.(i) +. y_grad.(i) *. mask.(i)
+      done in
+    { id = fresh_id (); data = y_data; grad = y_grad;
+      shape = [|s; dim|]; children = [|x|]; backward_fn = backward }
+  end
 
 (* batch_embed: look up token embeddings for a sequence of token IDs. *)
 let batch_embed wte tokens n_embd =

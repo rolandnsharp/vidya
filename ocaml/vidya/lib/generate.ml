@@ -15,6 +15,7 @@
    Feeds BOS, then autoregressively samples until BOS is produced
    again or block_size is reached. *)
 let sample model know ?forth_know bos_id temperature =
+  Tensor.training := false;
   let sym_ctx = Symbolic.create ?forth_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
   let token_id = ref bos_id in
@@ -40,6 +41,7 @@ let sample model know ?forth_know bos_id temperature =
    prompt tokens (no sampling during prefill), then sample
    continuation tokens autoregressively with symbolic constraints. *)
 let prompted model know ?forth_know tok bos_id prompt temperature =
+  Tensor.training := false;
   let sym_ctx = Symbolic.create ?forth_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
   let prompt_ids = Bpe.encode tok prompt in
@@ -79,6 +81,7 @@ let prompted model know ?forth_know tok bos_id prompt temperature =
    Encodes "<|user|> {input} <|assistant|>" as the prompt, prefills
    the KV cache, then samples until <|user|> or BOS is produced. *)
 let chat model know ?forth_know tok user_input temperature =
+  Tensor.training := false;
   let sym_ctx = Symbolic.create ?forth_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
   let prompt = Printf.sprintf "<|user|> %s <|assistant|>" user_input in

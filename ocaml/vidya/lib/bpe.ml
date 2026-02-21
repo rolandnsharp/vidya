@@ -48,7 +48,7 @@ let replace_all ~pattern ~replacement s =
     Buffer.contents buf
   end
 
-let n_merges = 500
+let n_merges = 2000
 
 (* train: Learn BPE merges from the training corpus.
    1. Build char vocab from all unique characters in docs
@@ -56,7 +56,7 @@ let n_merges = 500
    3. For each merge round: count pairs, merge most frequent
 
    OPTIMIZATION: Uses a flat int array for pair counts instead of Hashtbl.
-   Array size: max_id² ≈ 580² = 336,400 ints ≈ 2.7MB.
+   Array size: max_id² ≈ 2100² = 4,410,000 ints ≈ 35MB.
    Zeroing each round via Array.fill is a single fast memset. *)
 let train docs n_merges =
   (* Strip special tokens from docs before BPE training —
