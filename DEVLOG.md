@@ -199,9 +199,43 @@ step 30000  loss 2.2101
 ```
 
 Fast drop to ~2.5 in first 15K steps, then gradual descent. Starting to flatten
-around 2.2 at 30K (15% through). Expect plateau around 1.8-2.0 — the 580 vocab
-forces the model to spend capacity on character assembly rather than language.
-v3 retrain with 2100 vocab should break through this floor.
+around 2.2 at 30K (15% through). Killed at step 40K (loss 2.1125) — curve had
+told us what it was going to tell us. Plateau would have been ~1.9-2.0.
+
+### v3 training loss curve (in progress)
+
+2000 merges, 2188 vocab, 37K docs, learnable norms, dropout p=0.1.
+
+```
+step  2500  loss 5.1794
+step  5000  loss 4.0907
+step  7500  loss 3.8123
+step 10000  loss 3.6526
+step 12500  loss 3.5279
+step 15000  loss 3.4533
+step 17500  loss 3.3583
+step 20000  loss 3.2915
+step 22500  loss 3.2455
+step 25000  loss 3.1927
+step 27500  loss 3.1621
+step 30000  loss 3.1022
+step 32500  loss 3.0888
+step 35000  loss 3.0437
+step 37500  loss 3.0128
+step 40000  loss 2.9762
+step 42500  loss 2.9389
+step 45000  loss 2.9071
+```
+
+Higher absolute loss than v1 at same steps — expected because vocab is 3.6x
+larger (2188 vs 606). Relative to random baseline (ln(vocab)):
+
+    v1: 2.11 / ln(606) = 33% of random
+    v3: 2.91 / ln(2188) = 38% of random (at 45K, still descending)
+
+Descent rate per 10K steps: -1.53, -0.36, -0.19, -0.13, -0.14. Not flattening
+yet at 45K — v1 was already plateauing at 40K. Each token covers 4.2 chars
+(vs 2.8), so the model is learning bigger semantic chunks.
 
 ## Scaling to 100M params — planning notes
 

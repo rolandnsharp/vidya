@@ -1,0 +1,3 @@
+(library
+ (name symbolic_eval)
+ (libraries llama_stubs))

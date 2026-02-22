@@ -94,9 +94,18 @@ let pre_tokenize docs tok =
   tokenized
 
 (* Main training loop. *)
+let format_duration secs =
+  let h = int_of_float secs / 3600 in
+  let m = (int_of_float secs mod 3600) / 60 in
+  let s = int_of_float secs mod 60 in
+  if h > 0 then Printf.sprintf "%dh%02dm%02ds" h m s
+  else if m > 0 then Printf.sprintf "%dm%02ds" m s
+  else Printf.sprintf "%ds" s
+
 let train model params tokenized_docs num_steps =
   let adam = init_adam params in
   let loss_sum = ref 0.0 in
+  let t_start = Sys.time () in
   for step = 0 to num_steps - 1 do
     let tokens = tokenized_docs.(step mod Array.length tokenized_docs) in
     let (loss, _) = compute_loss model tokens in
@@ -105,8 +114,13 @@ let train model params tokenized_docs num_steps =
     clip_grad_norm params;
     adam_step params adam step num_steps;
     if (step + 1) mod 2500 = 0 then begin
-      Printf.printf "step %5d / %5d | loss %.4f\n%!"
-        (step + 1) num_steps (!loss_sum /. 2500.0);
+      let elapsed = Sys.time () -. t_start in
+      let steps_done = float_of_int (step + 1) in
+      let steps_left = float_of_int (num_steps - step - 1) in
+      let eta = elapsed *. steps_left /. steps_done in
+      Printf.printf "step %5d / %d | loss %.4f | %s elapsed | %s remaining\n%!"
+        (step + 1) num_steps (!loss_sum /. 2500.0)
+        (format_duration elapsed) (format_duration eta);
       loss_sum := 0.0
     end
   done

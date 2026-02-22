@@ -1,0 +1,3 @@
+(library
+ (name forth_evolution)
+ (libraries llama_stubs_fe))

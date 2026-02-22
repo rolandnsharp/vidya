@@ -88,6 +88,7 @@ let chat model know ?concept_know tok user_input temperature =
   let prompt_ids = Bpe.encode tok prompt in
   let buf = Buffer.create 256 in
   let n_prompt = Array.length prompt_ids in
+  let special_ids = [tok.Bpe.bos_id; tok.Bpe.user_id; tok.Bpe.assistant_id] in
   (* Prefill: feed prompt tokens without sampling *)
   for i = 0 to n_prompt - 2 do
     ignore (Forward.gpt_forward model prompt_ids.(i) kv_caches);
@@ -96,21 +97,34 @@ let chat model know ?concept_know tok user_input temperature =
   done;
   let token_id = ref prompt_ids.(n_prompt - 1) in
   Symbolic.record_token sym_ctx !token_id;
-  (* Generate: sample until <|user|> or BOS or max length *)
-  let pos = ref n_prompt in
-  while !pos < Model.block_size do
+  (* Generate: sample up to 200 content tokens.
+     Special tokens are suppressed from logits to force content generation.
+     Stop early if the model's top unsuppressed pick is a special token. *)
+  let max_gen = 200 in
+  let gen = ref 0 in
+  let stop = ref false in
+  while !gen < max_gen && not !stop do
     let logits = Forward.gpt_forward model !token_id kv_caches in
-    let constrained = Symbolic.apply sym_ctx logits.Tensor.data in
-    let scaled = Array.map (fun x -> x /. temperature) constrained in
-    let probs = Tensor.softmax (Tensor.make_param [|Array.length scaled|] scaled) in
-    token_id := Utils.weighted_choice probs.Tensor.data;
-    if !token_id = tok.Bpe.bos_id || !token_id = tok.Bpe.user_id then
-      pos := Model.block_size
+    let logit_data = logits.Tensor.data in
+    (* Check if model naturally wants to stop (top token is special) *)
+    let top_id = ref 0 in
+    let top_val = ref neg_infinity in
+    Array.iteri (fun i v -> if v > !top_val then (top_id := i; top_val := v))
+      logit_data;
+    if !gen > 5 && List.mem !top_id special_ids then
+      stop := true
     else begin
+      (* Suppress special tokens, then top-k filtering *)
+      let suppressed = Array.copy logit_data in
+      List.iter (fun id -> suppressed.(id) <- -1e9) special_ids;
+      let filtered = Utils.top_k 40 suppressed in
+      let scaled = Array.map (fun x -> x /. temperature) filtered in
+      let probs = Tensor.softmax (Tensor.make_param [|Array.length scaled|] scaled) in
+      token_id := Utils.weighted_choice probs.Tensor.data;
       Symbolic.td_update sym_ctx logits.Tensor.data !token_id;
       Symbolic.record_token sym_ctx !token_id;
       Buffer.add_string buf know.Symbolic.vocab.(!token_id);
-      incr pos
+      incr gen
     end
   done;
   String.trim (Buffer.contents buf)

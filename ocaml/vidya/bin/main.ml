@@ -96,12 +96,24 @@ let () =
       |> Printf.printf "  %2d: %s\n" i
     done
   end else begin
-    Printf.printf "--- inference (new, hallucinated text) ---\n";
-    for i = 1 to 20 do
-      Vidya.Generate.sample model know ~concept_know
-        tok.bos_id 0.5
-      |> Printf.printf "sample %2d: %s\n" i
-    done
+    Printf.printf "--- inference (chat test) ---\n";
+    let test_prompts = [
+      "Hello";
+      "How are you?";
+      "What is the meaning of life?";
+      "Tell me a story";
+      "What do you think about music?";
+    ] in
+    let temps = [0.3; 0.5; 0.8] in
+    List.iter (fun temp ->
+      Printf.printf "--- temperature %.1f ---\n" temp;
+      List.iter (fun p ->
+        Printf.printf "user: %s\n" p;
+        let response = Vidya.Generate.chat model know ~concept_know
+          tok p temp in
+        Printf.printf "  → %s\n\n" response
+      ) test_prompts
+    ) temps
   end;
   Vidya.Knowledge.save_weights "td_weights.bin" concept_know;
   Printf.printf "total time: %.2fs\n" (Sys.time () -. t_start)

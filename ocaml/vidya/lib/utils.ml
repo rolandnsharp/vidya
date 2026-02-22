@@ -63,6 +63,21 @@ let weighted_choice weights =
   ) (0, r) weights
   |> fst
 
+(* Top-k sampling: keep only the k highest logits, set the rest to -inf.
+   Returns a new array. The original is not modified. *)
+let top_k k logits =
+  let n = Array.length logits in
+  let k = min k n in
+  (* Build (value, index) pairs and sort descending by value *)
+  let indexed = Array.init n (fun i -> (logits.(i), i)) in
+  Array.sort (fun (a, _) (b, _) -> compare b a) indexed;
+  (* Find the threshold: the k-th highest value *)
+  let threshold = fst indexed.(k - 1) in
+  (* Zero out everything below the threshold *)
+  Array.init n (fun i ->
+    if logits.(i) >= threshold then logits.(i) else neg_infinity
+  )
+
 (* Load a text file as an array of non-empty trimmed lines, shuffled.
    Used to load the training corpus (one doc per line). *)
 let load_docs filename =

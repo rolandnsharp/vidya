@@ -1,0 +1,5 @@
+(library
+ (name llama_stubs_fe)
+ (c_names llama_stubs)
+ (c_library_flags (-lllama -lm -lstdc++))
+ (c_flags (-I/usr/local/include)))
