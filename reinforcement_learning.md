@@ -1616,6 +1616,52 @@ a swap file. The trick is accepting that training happens at human speed
 instead of machine speed — and realising that for interactive RL, human
 speed is all you need.
 
+### Continued Pre-Training: Give It a Book
+
+Interactive RL teaches the model one response at a time — shaping behaviour,
+style, and personality. But there is a second mode of learning: reading. Feed
+the model a text file and let it do continued pre-training.
+
+The mechanism is the same sliding window used in initial SFT. Tokenize the
+text, slide a window of `block_size` tokens across it, do one gradient step
+per window. A 50,000-word book is roughly 70,000 tokens. With a 256-token
+window that is about 270 gradient steps. On a CPU, a few minutes.
+
+**Why this matters:**
+
+The initial supervised fine-tuning gives the model generic language ability —
+grammar, turn-taking, sentence formation. But that training data is not
+personal. It is a bootstrap. The model does not need to remember every pattern
+from the original corpus. It needs to remember how to speak. The rest can be
+replaced with what we actually want it to know.
+
+This creates three layers of learning:
+
+1. **Initial SFT** (rented GPU) — teaches the model to speak
+2. **Continued pre-training** (CPU, book files) — teaches it knowledge
+3. **Interactive RL** (CPU, human in the loop) — teaches it personality
+
+Read first, then teach. The books give it something to know. The conversations
+shape how it uses that knowledge.
+
+**Implementation:**
+
+A `--read book.txt` flag that:
+1. Loads the checkpoint
+2. Tokenizes the book
+3. Slides a window, one gradient step per window
+4. Saves the checkpoint
+
+The code is the same training loop pointed at a different file. The learning
+rate should be lower than interactive RL (maybe 1e-6) to avoid overwriting
+language ability too aggressively. Interleaving book chunks with original
+training examples would reduce catastrophic forgetting, at the cost of
+needing to load the original corpus.
+
+At 10M parameters, capacity is tight — a single book might consume much of
+the model's representational budget. At 1B+, there should be room for
+language ability, book knowledge, and learned personality all coexisting.
+
 ---
 
 ## Key References & Links
