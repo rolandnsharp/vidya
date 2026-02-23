@@ -969,13 +969,16 @@ foundation.
 ### Current Architecture (No RL)
 
 Vidya is a neurosymbolic language model:
-- **Neural**: 6-layer GPT-2 style transformer (1.25M params, RoPE, KV-cache)
-- **Symbolic**: 5 constraints applied to logits before sampling
+- **Neural**: 12-layer GPT-2 style transformer (10M params, 256d, 8 heads,
+  RoPE, KV-cache, dropout 0.1, BPE vocab ~2218)
+- **Symbolic**: 5 constraints applied to logits before sampling (currently
+  bypassed in chat mode — raw logits + top-k 40 + repetition penalty work better)
 - **Knowledge**: Forth dictionary of concepts extracted from corpus statistics
+- **Training data**: 123K conversations (DailyDialog, SODA, ShareGPT, UltraChat)
 
 The neural model learns via standard **supervised learning** (cross-entropy
-loss, Adam optimizer, cosine schedule). The symbolic layer uses **hand-crafted
-rules**. There is no reinforcement learning.
+loss, Adam optimizer, cosine schedule, 300K steps). The symbolic layer uses
+**hand-crafted rules**. There is no reinforcement learning yet.
 
 ### Where RL Could Enter
 
@@ -1065,6 +1068,267 @@ theta += alpha * delta * e    ; update proportional to trace
 This is exactly what TD(lambda) with replacing traces does (Mountain Car
 example above).
 
+### The Three Sutton Principles for Vidya
+
+Sutton's RL agents learn without large pretrained models. A tabular Q-learner
+with 100 states masters gridworlds purely from reward. The power comes from
+three principles that Vidya currently lacks:
+
+**1. Trial and Error (Learning from Consequences)**
+
+Vidya learns only by imitation — copy the training data token by token. It never
+generates a response, sees whether it was good, and adjusts. Sutton's agents all
+learn by *doing* and observing outcomes. Every algorithm above — TD, Q-learning,
+Monte Carlo, policy gradient — learns from consequences of actions taken.
+
+For Vidya: generate responses, evaluate them, update weights toward good ones.
+
+**2. Credit Assignment (Which Token Mattered?)**
+
+Vidya's NLL loss treats every token equally. The 3rd token in a 50-token
+response gets the same gradient weight as the 47th. But some tokens matter more
+than others — the one that derailed the topic, or the one that introduced a good
+idea. Sutton's TD learning with eligibility traces solves exactly this: tokens
+that recently contributed to a state transition get more credit when reward
+arrives.
+
+For Vidya: use TD error to weight token-level gradient updates. Tokens that
+shifted the response from bad trajectory to good get more credit.
+
+**3. Exploration (Deliberately Trying New Things)**
+
+Vidya samples from its learned distribution — a form of passive exploration via
+randomness. Sutton's agents actively explore: epsilon-greedy tries random
+actions, UCB explores uncertain actions, optimistic initialization drives early
+exploration. Active exploration discovers capabilities the model has but doesn't
+use by default.
+
+For Vidya: higher temperature during RL training, entropy bonuses, or
+best-of-N generation to expose the full capability frontier.
+
+### Human-in-the-Loop RL (The Best-of-N Bandit)
+
+The most direct application of all three principles:
+
+```
+State:   user's question (the conversation so far)
+Actions: N=5 candidate responses generated at temperature 0.7
+Reward:  human selects the best response (reward=1, others=0)
+Update:  reinforce the selected response
+```
+
+This is a **multi-armed bandit with human feedback**. Each generation step
+pulls 5 arms. The human provides the reward signal by selecting the best.
+
+Why this works for a 10M param model:
+- The model's probability distribution already contains good and bad responses
+- Best-of-5 at temp 0.7 surfaces this diversity — the human sees the range
+- Selection signal is perfect (no proxy reward function, no heuristic noise)
+- 50-100 human selections on targeted prompts can meaningfully shift a 10M model
+
+The update mechanism has two options:
+
+**Option A — Expert Iteration (simple):**
+Train on the selected response using standard NLL loss. Just like supervised
+training but on the model's own best output rather than the training corpus.
+
+**Option B — Gradient Bandit (Sutton Chapter 2):**
+For each of the 5 responses, compute a preference update:
+```
+advantage = reward - baseline     (1 - 0.2 = 0.8 for selected, 0 - 0.2 = -0.2 for others)
+H(response) += alpha * advantage  (increase preference for selected, decrease for rejected)
+```
+This learns faster because it extracts signal from all 5 responses, not just
+the winner. In practice: do a forward pass on all 5, compute NLL for each,
+update weights: `loss = -sum(advantage_i * log_prob_i)`.
+
+**Interactive training loop:**
+```
+repeat:
+  1. present a prompt to the model
+  2. generate 5 responses at temperature 0.7
+  3. display all 5 to the human
+  4. human selects the best (or rates them 1-5)
+  5. compute policy gradient update
+  6. apply gradient step with low learning rate
+  7. optionally: show the same prompt again to verify improvement
+```
+
+This captures all three Sutton principles:
+- Trial and error: the model tries 5 things, learns which worked
+- Credit assignment: the human selection implicitly identifies good token sequences
+- Exploration: temperature 0.7 + 5 candidates ensures diverse exploration
+
+### The RL Training Ladder
+
+Three methods, increasing in sophistication. Each builds on the previous:
+
+**Rung 1: Expert Iteration (ExIt)**
+
+Generate N responses. Keep the best. Train on it with standard NLL loss.
+
+```
+for each step:
+  prompt = random prompt from training data (or human-provided)
+  responses = [generate(prompt, temp=0.7) for _ in 1..N]
+  best = human_select(responses)  OR  max(reward(r) for r in responses)
+  tokens = encode(prompt + best)
+  loss = NLL(model, tokens)        # same loss as supervised training
+  backward(loss)
+  adam_step(params, lr=1e-5)
+```
+
+This is the simplest thing that could possibly work. It uses the existing
+training infrastructure unchanged. The only new code is the generation loop
+and the selection/reward function.
+
+Why it works: the model already *can* produce the good response (it generated
+it). ExIt just makes that response more likely next time.
+
+**Rung 2: REINFORCE (Policy Gradient)**
+
+Generate a response. Score it. Weight the gradient by advantage.
+
+```
+baseline = 0.0  # running average of rewards
+
+for each step:
+  prompt = random prompt
+  response = generate(prompt, temp=0.7)
+  R = reward(response)  OR  human_rating
+  advantage = R - baseline
+  baseline += 0.05 * (R - baseline)
+
+  tokens = encode(prompt + response)
+  logits = batch_forward(model, tokens)    # full autograd graph
+  nll = mean(NLL per response token)       # only response tokens, not prompt
+  loss = -advantage * nll
+  backward(loss)
+  adam_step(params, lr=1e-5)
+```
+
+The key difference from ExIt: REINFORCE learns from *every* response, not just
+the best. A bad response with negative advantage pushes the model *away* from
+those tokens. This extracts more signal per generation.
+
+The sign trick: when advantage > 0, minimizing `-advantage * nll` means
+minimizing nll (reinforcing the response). When advantage < 0, minimizing
+`-advantage * nll` means maximizing nll (suppressing the response).
+
+**Rung 3: The Human Bandit (Best-of-N with Gradient Bandits)**
+
+Generate N responses. Human selects the best. Update toward winner, away from
+losers. This combines ExIt's selection with REINFORCE's contrastive signal.
+
+```
+baseline = 1.0 / N   # expected reward under random selection
+
+for each step:
+  prompt = human-provided or random
+  responses = [generate(prompt, temp=0.7) for _ in 1..N]
+  display responses to human
+  human selects response k
+
+  for i in 1..N:
+    tokens_i = encode(prompt + responses[i])
+    logits_i = batch_forward(model, tokens_i)
+    nll_i = mean(NLL per response token)
+    reward_i = 1.0 if i == k else 0.0
+    advantage_i = reward_i - baseline
+    loss += -advantage_i * nll_i
+
+  backward(loss)
+  adam_step(params, lr=1e-5)
+```
+
+This is the gradient bandit algorithm (Sutton Chapter 2, Figure 2.5) applied to
+response-level preferences. Selected response gets advantage +0.8, rejected get
+-0.2. The model learns from all N responses in one step.
+
+### The Two-Pass Trick
+
+A subtlety in the implementation: Vidya's inference forward pass (`gpt_forward`)
+uses a KV cache and builds no autograd graph — backward is a no-op. This is fast
+for generation but means we can't backpropagate through it.
+
+Solution: two passes.
+
+```
+Pass 1 (inference): generate the response token by token
+  - Uses gpt_forward with KV cache
+  - Fast, no memory overhead
+  - Produces: the token sequence
+
+Pass 2 (training): forward the full sequence through batch forward
+  - Uses gpt_forward_batch (same as supervised training)
+  - Builds full autograd graph
+  - Produces: differentiable log-probabilities for every token
+  - These log-probs are what we backprop through
+```
+
+This is standard in RLHF (InstructGPT, LLaMA-2 all do this). The generation
+step is just sampling — the learning step is a separate differentiable forward
+pass on the already-generated sequence.
+
+Vidya already has both passes implemented:
+- `Forward.gpt_forward` (inference, KV cache, no grad)
+- `Forward.gpt_forward_batch` (training, batched, full autograd)
+
+### Token-Level Credit Assignment
+
+Per-sequence reward (REINFORCE) gives the same gradient to every token. The
+first token gets as much credit as the last. This is wasteful — usually only
+a few tokens determine whether a response is good or bad.
+
+Sutton's eligibility traces (TD(lambda)) solve this for tabular RL. For our
+neural model, we can approximate it:
+
+**Position-weighted rewards:**
+
+The simplest credit assignment: tokens later in the response get less credit
+because they had less influence on the overall direction.
+
+```
+weight(t) = gamma^(T - t)    where T = response length, gamma = 0.95
+loss = -advantage * mean(weight(t) * nll(t) for t in response)
+```
+
+Early tokens that set the direction get weight ~1.0. Late tokens that are
+just following the established pattern get weight ~0.5-0.7.
+
+**Reward difference (poor man's TD):**
+
+If we have a token-level value estimator (even a simple one like "average
+log-prob of remaining tokens"), we can compute a TD-like error:
+
+```
+delta(t) = R + V(s_{t+1}) - V(s_t)
+```
+
+Tokens where the value jumped up (good token choice) get positive delta.
+Tokens where value dropped (bad token choice) get negative delta. This is
+more targeted than per-sequence reward.
+
+For v1: use position-weighted rewards. Simple, no new infrastructure.
+For v2: add a value head (one extra [256, 1] weight vector) for TD errors.
+
+### Collapse Prevention
+
+RL on a small model is dangerous. The model can collapse to always generating
+the same high-reward response. Mitigations:
+
+1. **Low learning rate** (1e-5, 100x lower than supervised peak)
+2. **Few steps** (500-2000 automated, 50-200 human)
+3. **Entropy bonus**: add `+ beta * entropy(softmax(logits))` to reward.
+   Encourages diverse token distributions. beta = 0.01.
+4. **KL penalty** (optional): keep frozen copy of base weights, add
+   `- beta * KL(current_policy || base_policy)` to reward. Prevents
+   drifting too far from the pretrained model. beta = 0.1.
+5. **Checkpoint before RL**: always save a copy before starting. If the
+   model collapses, reload and try with lower LR or fewer steps.
+6. **Diverse prompts**: don't repeat the same prompt. Each RL step should
+   use a different conversation starter.
+
 ### Proposed Architecture: Vidya-RL
 
 ```
@@ -1073,25 +1337,94 @@ Corpus --> BPE Training --> Tokenizer
                     +----------+----------+
                     |                     |
               Neural Training      Knowledge Extraction
-              (supervised)         (corpus statistics)
+              (supervised, 300K    (corpus statistics)
+               steps, NLL loss)
                     |                     |
                     v                     v
               Transformer          Forth Dictionary
-              (6L, 128d)          (concepts, assoc.)
+              (12L, 256d, 10M)    (concepts, assoc.)
                     |                     |
                     +----------+----------+
                                |
-                         Generation Loop:
+                    RL Fine-Tuning Phase:
+                    1. Pick prompt (random or human-provided)
+                    2. Generate N responses (temp 0.7)       <-- EXPLORATION
+                    3. Score responses (human or automated)   <-- TRIAL & ERROR
+                    4. Compute advantage per response
+                    5. Batch forward on each response (autograd)
+                    6. Policy gradient: -advantage * NLL      <-- CREDIT ASSIGN
+                    7. Backward + Adam step (lr=1e-5)
+                    8. Repeat 500-2000 times
+                               |
+                    Inference (unchanged):
                     1. Forward pass -> logits
-                    2. Symbolic constraints -> constrained logits
-                    3. RL value adjustment -> final logits    <-- NEW
-                    4. Softmax, sample token
-                    5. Compute reward signal                  <-- NEW
-                    6. TD update to value estimates            <-- NEW
-                    7. Update Forth knowledge if needed        <-- NEW
+                    2. Top-k 40 + repetition penalty
+                    3. Temperature scaling + softmax
+                    4. Sample token
                                |
                          Output text
 ```
+
+### Implementation
+
+The RL training system is implemented in `ocaml/vidya/lib/train.ml` and invoked
+via CLI flags in `ocaml/vidya/bin/main.ml`.
+
+**Usage** (once v4 training finishes):
+
+```bash
+cd ocaml/vidya
+
+# ExIt: generate 4 responses per prompt, keep best, SFT on it (1000 steps)
+dune exec bin/main.exe -- --load --rl
+
+# REINFORCE: policy gradient on response tokens (1000 steps)
+dune exec bin/main.exe -- --load --rl --reinforce
+
+# Custom step count
+dune exec bin/main.exe -- --load --rl --rl-steps 2000
+
+# Test the result
+dune exec bin/main.exe -- --load --chat
+```
+
+**The RL ladder**: ExIt first (safe — just supervised training on best-of-4),
+then REINFORCE (actual policy gradient). Both use LR 1e-5 (100x lower than SFT)
+to prevent collapse.
+
+**Files changed:**
+
+| File | What was added |
+|------|---------------|
+| `lib/train.ml` | `extract_prompts`, `compute_rl_reward`, `compute_loss_response`, `adam_step_fixed`, `rl_train` |
+| `lib/generate.ml` | `chat_rollout` — like `chat` but returns token ID arrays |
+| `bin/main.ml` | `--rl`, `--reinforce`, `--rl-steps` flags |
+
+**Checkpoint safety**: RL saves to `*_rl.bin` (e.g. `microgpt_chat_10m_v4_rl.bin`),
+never overwrites the base model. If the model collapses, reload the original and
+try with fewer steps or lower LR.
+
+**Reward function** (`compute_rl_reward`):
+
+```
+reward = 0.3 * length      (prefer 15-80 tokens)
+       + 0.3 * diversity    (unique tokens / total)
+       + 0.2 * no_repeat    (1 - repeated bigrams / total)
+       + 0.1 * ending       (+0.5 for . ? ! ending, -0.5 otherwise)
+       + 0.1 * relevance    (prompt token overlap)
+```
+
+**What to watch during training:**
+
+```
+rl   50 / 1000 | reward 0.412 | loss 3.8521 | baseline 0.380 | 2m15s
+rl  100 / 1000 | reward 0.445 | loss 3.7103 | baseline 0.401 | 4m30s
+```
+
+- **reward trending up** = model generating better responses
+- **loss staying bounded** = no collapse
+- **baseline tracking reward** = advantage is well-calibrated
+- If loss spikes or reward flatlines, stop and reduce `--rl-steps`
 
 ---
 

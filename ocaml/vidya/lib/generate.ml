@@ -77,15 +77,20 @@ let prompted model know ?concept_know tok bos_id prompt temperature =
   done;
   Buffer.contents buf
 
-(* chat: Format user input as a chat turn, generate assistant response.
-   Encodes "<|user|> {input} <|assistant|>" as the prompt, prefills
-   the KV cache, then samples until <|user|> or BOS is produced. *)
-let chat model know ?concept_know tok user_input temperature =
+(* chat: Generate assistant response given full conversation history.
+   history is everything up to and including the latest "<|assistant|>".
+   Prefills KV cache with the full history, then samples. *)
+let chat model know ?concept_know tok history temperature =
   Tensor.training := false;
   let sym_ctx = Symbolic.create ?concept_know know in
   let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
-  let prompt = Printf.sprintf "<|user|> %s <|assistant|>" user_input in
-  let prompt_ids = Bpe.encode tok prompt in
+  (* Truncate history to fit in context window, keeping most recent turns *)
+  let all_ids = Bpe.encode tok history in
+  let max_prompt = Model.block_size - 50 in
+  let prompt_ids =
+    if Array.length all_ids <= max_prompt then all_ids
+    else Array.sub all_ids (Array.length all_ids - max_prompt) max_prompt
+  in
   let buf = Buffer.create 256 in
   let n_prompt = Array.length prompt_ids in
   let special_ids = [tok.Bpe.bos_id; tok.Bpe.user_id; tok.Bpe.assistant_id] in
@@ -103,6 +108,8 @@ let chat model know ?concept_know tok user_input temperature =
   let max_gen = 200 in
   let gen = ref 0 in
   let stop = ref false in
+  let recent_tokens = Hashtbl.create 64 in
+  let rep_penalty = 1.3 in
   while !gen < max_gen && not !stop do
     let logits = Forward.gpt_forward model !token_id kv_caches in
     let logit_data = logits.Tensor.data in
@@ -114,13 +121,21 @@ let chat model know ?concept_know tok user_input temperature =
     if !gen > 5 && List.mem !top_id special_ids then
       stop := true
     else begin
-      (* Suppress special tokens, then top-k filtering *)
+      (* Suppress special tokens *)
       let suppressed = Array.copy logit_data in
       List.iter (fun id -> suppressed.(id) <- -1e9) special_ids;
+      (* Repetition penalty: divide positive logits, multiply negative ones *)
+      Hashtbl.iter (fun tok_id _ ->
+        if suppressed.(tok_id) > 0.0 then
+          suppressed.(tok_id) <- suppressed.(tok_id) /. rep_penalty
+        else
+          suppressed.(tok_id) <- suppressed.(tok_id) *. rep_penalty
+      ) recent_tokens;
       let filtered = Utils.top_k 40 suppressed in
       let scaled = Array.map (fun x -> x /. temperature) filtered in
       let probs = Tensor.softmax (Tensor.make_param [|Array.length scaled|] scaled) in
       token_id := Utils.weighted_choice probs.Tensor.data;
+      Hashtbl.replace recent_tokens !token_id true;
       Symbolic.td_update sym_ctx logits.Tensor.data !token_id;
       Symbolic.record_token sym_ctx !token_id;
       Buffer.add_string buf know.Symbolic.vocab.(!token_id);
@@ -128,3 +143,46 @@ let chat model know ?concept_know tok user_input temperature =
     end
   done;
   String.trim (Buffer.contents buf)
+
+(* chat_rollout: Like chat but returns generated token IDs as an array.
+   Used by RL training to build training sequences and compute rewards. *)
+let chat_rollout model tok history temperature =
+  Tensor.training := false;
+  let kv_caches = Array.init Model.n_layer (fun _ -> Model.make_kv_cache ()) in
+  let all_ids = Bpe.encode tok history in
+  let max_prompt = Model.block_size - 50 in
+  let prompt_ids =
+    if Array.length all_ids <= max_prompt then all_ids
+    else Array.sub all_ids (Array.length all_ids - max_prompt) max_prompt
+  in
+  let n_prompt = Array.length prompt_ids in
+  let special_ids = [tok.Bpe.bos_id; tok.Bpe.user_id; tok.Bpe.assistant_id] in
+  for i = 0 to n_prompt - 2 do
+    ignore (Forward.gpt_forward model prompt_ids.(i) kv_caches)
+  done;
+  let token_id = ref prompt_ids.(n_prompt - 1) in
+  let max_gen = 200 in
+  let gen_tokens = Array.make max_gen 0 in
+  let gen = ref 0 in
+  let stop = ref false in
+  while !gen < max_gen && not !stop do
+    let logits = Forward.gpt_forward model !token_id kv_caches in
+    let logit_data = logits.Tensor.data in
+    let top_id = ref 0 in
+    let top_val = ref neg_infinity in
+    Array.iteri (fun i v -> if v > !top_val then (top_id := i; top_val := v))
+      logit_data;
+    if !gen > 5 && List.mem !top_id special_ids then
+      stop := true
+    else begin
+      let suppressed = Array.copy logit_data in
+      List.iter (fun id -> suppressed.(id) <- -1e9) special_ids;
+      let filtered = Utils.top_k 40 suppressed in
+      let scaled = Array.map (fun x -> x /. temperature) filtered in
+      let probs = Tensor.softmax (Tensor.make_param [|Array.length scaled|] scaled) in
+      token_id := Utils.weighted_choice probs.Tensor.data;
+      gen_tokens.(!gen) <- !token_id;
+      incr gen
+    end
+  done;
+  (prompt_ids, Array.sub gen_tokens 0 !gen)

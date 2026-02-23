@@ -8,6 +8,12 @@
                                          → load + prompted generation
      dune exec bin/main.exe -- --load --chat
                                          → load + interactive chat mode
+     dune exec bin/main.exe -- --load --rl
+                                         → load + ExIt RL fine-tuning (1000 steps)
+     dune exec bin/main.exe -- --load --rl --reinforce
+                                         → load + REINFORCE RL fine-tuning
+     dune exec bin/main.exe -- --load --rl --rl-steps 2000
+                                         → load + RL with custom step count
 
    BPE training always runs first (fast, ~3s, deterministic from corpus).
    Symbolic + concept knowledge built once, shared across all generations.
@@ -33,8 +39,8 @@ let get_flag_value flag =
 
 let () =
   let t_start = Sys.time () in
-  let checkpoint_file = "../../microgpt_chat_10m_v3.bin" in
-  let input_file = "../../chat_input.txt" in
+  let checkpoint_file = "../../microgpt_chat_10m_v4.bin" in
+  let input_file = "../../chat_input_v4.txt" in
 
   (* BPE is always needed (fast, ~3s) — deterministic from corpus *)
   let docs = Vidya.Utils.load_docs input_file in
@@ -55,8 +61,22 @@ let () =
     Printf.printf "skipping training (loaded from %s)\n%!" checkpoint_file
   end else begin
     let tokenized_docs = Vidya.Train.pre_tokenize docs tok in
-    Vidya.Train.train model params tokenized_docs 200000;
+    Vidya.Train.train model params tokenized_docs 300000
+      ~checkpoint_base:"../../microgpt_chat_10m_v4" ();
     Vidya.Train.save_checkpoint checkpoint_file params
+  end;
+
+  (* RL fine-tuning (optional, runs before inference) *)
+  if has_flag "--rl" then begin
+    let mode =
+      if has_flag "--reinforce" then `Reinforce else `ExIt in
+    let num_steps =
+      let s = get_flag_value "--rl-steps" in
+      if s <> "" then int_of_string s else 1000 in
+    Vidya.Train.rl_train model params tok docs ~num_steps ~mode ();
+    let rl_file =
+      (Filename.chop_extension checkpoint_file) ^ "_rl.bin" in
+    Vidya.Train.save_checkpoint rl_file params
   end;
 
   (* Build symbolic knowledge once — shared across all generations *)
@@ -70,8 +90,9 @@ let () =
   let prompt_text = get_flag_value "--prompt" in
 
   if has_flag "--chat" then begin
-    (* Interactive chat mode *)
+    (* Interactive chat mode with multi-turn context *)
     Printf.printf "--- chat mode (type 'quit' to exit) ---\n%!";
+    let history = Buffer.create 1024 in
     let running = ref true in
     while !running do
       Printf.printf "> %!";
@@ -82,9 +103,12 @@ let () =
         if trimmed = "quit" || trimmed = "exit" then
           running := false
         else begin
+          Buffer.add_string history
+            (Printf.sprintf "<|user|> %s <|assistant|>" trimmed);
           let response = Vidya.Generate.chat model know ~concept_know
-            tok trimmed 0.5 in
-          Printf.printf "%s\n%!" response
+            tok (Buffer.contents history) 0.5 in
+          Printf.printf "%s\n%!" response;
+          Buffer.add_string history (Printf.sprintf " %s " response)
         end
     done
   end else if prompt_text <> "" then begin
@@ -109,8 +133,9 @@ let () =
       Printf.printf "--- temperature %.1f ---\n" temp;
       List.iter (fun p ->
         Printf.printf "user: %s\n" p;
+        let history = Printf.sprintf "<|user|> %s <|assistant|>" p in
         let response = Vidya.Generate.chat model know ~concept_know
-          tok p temp in
+          tok history temp in
         Printf.printf "  → %s\n\n" response
       ) test_prompts
     ) temps
