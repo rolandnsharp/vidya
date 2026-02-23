@@ -32,17 +32,53 @@ fast ? How much does it forget ?
 
 This is the experiment . Everything else depends on the answer .
 
-**Phase 2 : Train from scratch , no GPU .**
+**Phase 1.5 : Expand the model .**
+
+The 10M model proves RL works but has limited capacity — every new thing
+it learns risks overwriting something old . Instead of starting from
+scratch , expand the existing model . Keep what it already knows , add
+room for more .
+
+Width expansion is the simplest approach . The 10M model has an embedding
+dimension (e.g. 128) . Double it to 256 and the model grows to ~40M
+params . The existing weights are copied into the first 128 columns of
+each larger matrix . The remaining columns are initialised with small
+random values . The model behaves almost identically at first — the new
+dimensions contribute near-nothing — but now has 4x the capacity for
+books and RL .
+
+Depth expansion is also possible : add new transformer layers initialised
+so their output is near-zero (approximating skip connections) . The model
+acts like the smaller version until the new layers learn .
+
+Implementation is a utility that :
+1. Loads the small checkpoint
+2. Creates a larger model
+3. Copies existing weights into the top-left corner of each matrix
+4. Initialises the rest with small random values
+5. Saves the new checkpoint
+
+A few minutes of book training after expansion should settle the noise
+from the random parameters . Then we have a model that already speaks ,
+with room to grow . This avoids starting from absolute scratch — the
+language knowledge from the GPU training carries forward .
+
+This can be repeated . 10M → 40M → 160M → 640M . Each expansion
+preserves what came before and adds capacity for what comes next . The
+GPU trains the seed . Everything after grows on CPU .
+
+**Phase 2 : Scale up , no GPU .**
 
 If interactive RL works — if the model measurably improves from human
 feedback at human speed — then the GPU becomes optional . Not just for
 RL , but for everything .
 
-Start from randomly initialised weights . No pre-trained checkpoint . No
-one else's training data . Feed it books one at a time — slide a window
-across the text , a few hundred gradient steps per book , a few minutes
-each on a CPU . Then talk to it . Interactive RL shapes its personality .
-The books shape its knowledge .
+Expand the model to the largest size the hardware supports . Buy 64 GB
+of RAM , set up SSD swap , grow the model to a billion parameters or
+more . Feed it books one at a time — slide a window across the text , a
+few hundred gradient steps per book , a few minutes each on a CPU . Then
+talk to it . Interactive RL shapes its personality . The books shape its
+knowledge .
 
 This is slow . A GPU does 300K steps in hours . On a CPU , feeding it
 books and having conversations , it could take months or years to reach
@@ -52,6 +88,7 @@ personal AI , one book and one conversation at a time .
 
 **The scaling path :**
 
+- 10M (GPU-trained) → 40M → 160M → 640M+ (expanded on CPU)
 - 64 GB DDR4 (~$70) + SSD swap (free) = enough memory for 1-5B params
 - Books for knowledge , conversations for personality , both on CPU
 - No cloud subscription , no GPU rental , no ongoing cost
