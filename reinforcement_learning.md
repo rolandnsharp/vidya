@@ -1555,6 +1555,67 @@ unexplored space. SFT probably uses 10-20% of the model's potential. RL could pu
 that to 50% or beyond. And when the parameters run out, the architecture is ready
 for a bigger model — same code, bigger weights, same training loop.
 
+### Swap-Backed Training: Breaking the RAM Barrier
+
+Interactive RL has an unusual property: the human is always the bottleneck.
+A training step that takes 30 seconds instead of 3 is irrelevant when the
+human takes a minute to read five responses and choose one. This means we
+can trade compute speed for memory capacity in ways that would be absurd
+for batch training but work perfectly for human-in-the-loop RL.
+
+The mechanism is simple: a large swap file on an SSD.
+
+```bash
+sudo fallocate -l 200G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+```
+
+The OS pages parameter arrays between RAM and SSD transparently. The OCaml
+code doesn't change at all. `float array` works whether the backing memory
+is physical RAM or virtual memory paged to disk. The only effect is slower
+access when a page needs to be swapped in — and at human interaction speed,
+that doesn't matter.
+
+**What this buys:**
+
+| Configuration | Training capacity | Cost |
+|--------------|------------------|------|
+| 16GB RAM (current) | ~300M params | $0 |
+| 64GB RAM (board max) | ~1B params | ~$70 |
+| 64GB RAM + 200GB swap on SSD | ~3-5B params | ~$70 |
+
+For comparison, an RTX 4090 with 24GB VRAM costs $1,600 and can only hold
+~500M params for training (with gradients + Adam state). 64GB of DDR4 RAM
+holds twice as much for 23x less money. And the swap file is free — it just
+uses disk space you already have.
+
+**Why nobody else does this:**
+
+Batch training (SFT, RLHF at scale) needs thousands of gradient steps per
+second. Swapping to disk would make each step 10-100x slower. At that scale,
+you need everything in fast memory — GPU VRAM ideally, RAM at minimum.
+
+Interactive RL needs one gradient step every 30-60 seconds. Even if swapping
+makes the step 10x slower (3 seconds instead of 0.3 seconds for a 1B model,
+30 seconds instead of 3 seconds for a 5B model), the human doesn't notice.
+They're still reading the responses.
+
+**The full scaling path:**
+
+1. Train a 1-5B model with SFT on a rented GPU (a few hours, a few dollars)
+2. Download the checkpoint to your home machine
+3. Max out RAM ($70 for 64GB DDR4), set up swap on SSD ($0)
+4. Run interactive RL: `--train` or `--prompt`/`--teach`
+5. The model learns from every conversation, one gradient step at a time
+6. No GPU needed. No cloud subscription. The model lives on your machine.
+
+Training that requires a $10,000 GPU cluster becomes a $70 RAM upgrade and
+a swap file. The trick is accepting that training happens at human speed
+instead of machine speed — and realising that for interactive RL, human
+speed is all you need.
+
 ---
 
 ## Key References & Links
