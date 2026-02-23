@@ -1426,6 +1426,135 @@ rl  100 / 1000 | reward 0.445 | loss 3.7103 | baseline 0.401 | 4m30s
 - **baseline tracking reward** = advantage is well-calibrated
 - If loss spikes or reward flatlines, stop and reduce `--rl-steps`
 
+### Interactive Training Mode (The Real Design)
+
+The batch RL modes above (`--rl`, `--reinforce`) are useful for automated
+fine-tuning with the hand-crafted reward function. But the real design is
+simpler and more powerful: **the chat interface is the training interface.**
+
+```
+> what is your name?
+1: It is Mr . Classic .
+2: My name is not important .
+3: I am a computer program .
+4: Yes . May I help you ?
+5: I do not have a name .
+> 1
+training on response 1... done.
+> what is your favorite color?
+1: It is very nice . the blue one of our most popular film .
+2: I like blue .
+3: Color is a concept .
+4: Yes .
+5: I do not know .
+> I like blue . It reminds me of the ocean .
+training on typed response... done.
+```
+
+The user either:
+- **Types a number (1-5)**: select the best response → train on it
+- **Types text**: provide a better response → train on that
+
+Both cases run the same function:
+
+```
+1. Encode prompt + chosen response as token sequence
+2. compute_loss (standard NLL — same as SFT training)
+3. Tensor.backward
+4. adam_step_fixed at lr=1e-5
+```
+
+One gradient step. Instant on CPU. Then the next question.
+
+**Why this is better than batch RL:**
+
+- No reward function needed. The human IS the reward.
+- No advantage estimation. No baseline. No policy gradient math.
+- Selection reinforces good responses (same as ExIt).
+- Typing injects new knowledge (breaks the capability ceiling).
+- Every interaction makes the model better. Training never stops.
+
+**This scales without a GPU.** One gradient step on one sequence is trivial.
+The model already does 300,000 during SFT training. One more takes a fraction
+of a second. The bottleneck is the human, not the hardware.
+
+The generation is the slow part — five forward passes through the model with
+KV cache. Maybe five seconds total at 10M params. The training step after
+selection is instant by comparison.
+
+**This scales with people.** If ten people are chatting with the model via a
+web interface, that's ten gradient steps per minute. A hundred people, a hundred
+steps. Each person thinks they're just having a conversation. The model is
+learning from all of them simultaneously.
+
+Ten friends chatting for an hour, making a selection every 30 seconds =
+12,000 gradient steps. An afternoon of conversation replaces weeks of
+automated RL training, with cleaner signal.
+
+The only engineering concern is concurrent weight access. If two people submit
+at the exact same moment, gradients could collide. At human interaction speed
+(seconds between messages), a simple mutex works. One step at a time, first
+come first served.
+
+### Scaling Parameters Without a GPU
+
+SFT is what costs three days — 300,000 gradient steps over sequences of 256
+tokens, each building a full autograd graph. That's the part that needs a GPU
+at scale.
+
+Interactive RL is one step at a time, whenever a human happens to send a
+message. The model sits idle between interactions. The compute per step scales
+with parameters, but one step on even a large model is seconds, not hours.
+
+| Model Size | SFT (300K steps) | Interactive RL (1 step) |
+|-----------|------------------|------------------------|
+| 10M params | ~3 days, CPU | < 1 second |
+| 100M params | ~1 month, CPU (impractical) | ~5 seconds |
+| 1B params | GPU required | ~30 seconds |
+
+**The path**: train a bigger model once with SFT — rent a GPU for a day, run
+the 300K steps, save the checkpoint. Then bring it home to the CPU. Interactive
+RL runs on anything because humans are slow. The model waits for you, not the
+other way around.
+
+### After RL: The Self-Improvement Loop
+
+Suppose RL works. The model generates better responses — longer, more coherent,
+ending naturally, reflecting the human's preferences. What comes next?
+
+**1. Autonomous ExIt.** The model can run the ExIt loop without a human. Generate
+4 responses per prompt, score with the reward function, train on the best. Run
+overnight. The improved model generates better best-of-4, which improves the
+next round's training signal. Each generation bootstraps the next.
+
+**2. Learned reward function.** Start with the hand-crafted reward (length,
+diversity, no-repeat). But the human selections collected during interactive
+training are labeled data for a reward model. A small network that predicts
+which response the human would pick. Once that exists, the model trains against
+learned preferences instead of heuristics.
+
+**3. Multi-turn RL.** Currently single-turn: one prompt, one response. But
+conversations are multi-turn. Reward based on whether the human stays engaged
+for 10 turns instead of abandoning after 3.
+
+**4. The Forth layer can be learned.** Right now symbolic constraints are
+hand-crafted and mostly bypassed. RL could discover which constraints actually
+help. Instead of hard-coding "boost tokens related to the current topic," let
+the model learn its own constraint policy. This is Sutton's bitter lesson
+applied directly — replace human knowledge with learned computation.
+
+**5. The human role shifts.** Early: you teach the model response by response,
+typing corrections and selecting favorites. Middle: you sit with it once a week,
+do a few hundred selections, and let autonomous ExIt run between sessions. Late:
+you design the curriculum — which prompts to train on, which capabilities to
+develop — and the model handles the rest.
+
+**The ceiling is the parameter count.** The model eventually runs out of capacity.
+It can't hold complex reasoning in 256 dimensions. But 10M parameters is a lot of
+unexplored space. SFT probably uses 10-20% of the model's potential. RL could push
+that to 50% or beyond. And when the parameters run out, the architecture is ready
+for a bigger model — same code, bigger weights, same training loop.
+
 ---
 
 ## Key References & Links
