@@ -19,6 +19,46 @@ A from-scratch language model training and inference framework, built incrementa
 
 ---
 
+## Current Direction
+
+**Phase 1 : Prove interactive RL works .**
+
+Train the 10M parameter model (Mr . Classic) on conversation data using
+a rented GPU . This is in progress — v4 SFT training , 300K gradient
+steps . When it finishes , sit with it and test interactive RL : generate
+five responses , pick the best or type a better one , one gradient step
+per interaction . Does the model actually learn from conversation ? How
+fast ? How much does it forget ?
+
+This is the experiment . Everything else depends on the answer .
+
+**Phase 2 : Train from scratch , no GPU .**
+
+If interactive RL works — if the model measurably improves from human
+feedback at human speed — then the GPU becomes optional . Not just for
+RL , but for everything .
+
+Start from randomly initialised weights . No pre-trained checkpoint . No
+one else's training data . Feed it books one at a time — slide a window
+across the text , a few hundred gradient steps per book , a few minutes
+each on a CPU . Then talk to it . Interactive RL shapes its personality .
+The books shape its knowledge .
+
+This is slow . A GPU does 300K steps in hours . On a CPU , feeding it
+books and having conversations , it could take months or years to reach
+the same capability . But every word it knows , you chose to teach it .
+Every behaviour , you shaped . It is a life's work — to upload your
+personal AI , one book and one conversation at a time .
+
+**The scaling path :**
+
+- 64 GB DDR4 (~$70) + SSD swap (free) = enough memory for 1-5B params
+- Books for knowledge , conversations for personality , both on CPU
+- No cloud subscription , no GPU rental , no ongoing cost
+- The model lives on your machine and learns from every interaction
+
+---
+
 ## Stage 1 — OCaml Scalar Port
 
 **Goal:** Identical behavior to microgpt.js/microgpt.py in OCaml. Prove correctness.
