@@ -39,33 +39,45 @@ it learns risks overwriting something old . Instead of starting from
 scratch , expand the existing model . Keep what it already knows , add
 room for more .
 
-Width expansion is the simplest approach . The 10M model has an embedding
-dimension (e.g. 128) . Double it to 256 and the model grows to ~40M
-params . The existing weights are copied into the first 128 columns of
-each larger matrix . The remaining columns are initialised with small
+Expand in all dimensions at once :
+
+**Width** (embedding dimension) — double from 128 to 256 . Every weight
+matrix gets wider . Existing weights are copied into the top-left corner
+of the larger matrix . New columns and rows are initialised with small
 random values . The model behaves almost identically at first — the new
-dimensions contribute near-nothing — but now has 4x the capacity for
-books and RL .
+dimensions contribute near-nothing — but now has much more capacity per
+layer to store knowledge .
 
-Depth expansion is also possible : add new transformer layers initialised
-so their output is near-zero (approximating skip connections) . The model
-acts like the smaller version until the new layers learn .
+**Depth** (number of layers) — add new transformer layers initialised so
+their output is near-zero (approximating skip connections) . The model
+acts like the smaller version until the new layers learn to contribute .
+More depth means more levels of abstraction — deeper reasoning chains .
 
-Implementation is a utility that :
+**Heads** (attention heads) — when doubling width , double heads to keep
+head dimension constant . More heads means more parallel attention
+patterns — the model can track more relationships simultaneously .
+
+**Context window** (block size) — extend how many tokens the model sees .
+With RoPE this extrapolates naturally — no new learned parameters needed .
+Longer context means the model can use more conversation history and
+read longer passages from books .
+
+All four dimensions grow together . A single `--expand` utility that :
 1. Loads the small checkpoint
-2. Creates a larger model
-3. Copies existing weights into the top-left corner of each matrix
-4. Initialises the rest with small random values
+2. Creates a larger model (2x width , 2x depth , 2x heads , 2x context)
+3. Copies existing weights into the corresponding positions
+4. Initialises new weights : small random for width/heads , near-zero
+   output for new layers
 5. Saves the new checkpoint
 
 A few minutes of book training after expansion should settle the noise
 from the random parameters . Then we have a model that already speaks ,
-with room to grow . This avoids starting from absolute scratch — the
-language knowledge from the GPU training carries forward .
+with room to grow in every dimension . This avoids starting from absolute
+scratch — the language knowledge from the GPU training carries forward .
 
-This can be repeated . 10M → 40M → 160M → 640M . Each expansion
-preserves what came before and adds capacity for what comes next . The
-GPU trains the seed . Everything after grows on CPU .
+This can be repeated . Each expansion preserves what came before and adds
+capacity for what comes next . The GPU trains the seed . Everything after
+grows on CPU .
 
 **Phase 2 : Scale up , no GPU .**
 
