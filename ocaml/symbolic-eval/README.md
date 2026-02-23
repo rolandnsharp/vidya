@@ -53,6 +53,33 @@ Compare generations with and without the symbolic layer on the same prompts:
 - Human preference (blind A/B comparison)
 - TD learning curve (do associations improve over time?)
 
+## Relationship to Vidya
+
+This is a side project to the main Vidya work. Vidya trains a 10M parameter
+model from scratch in OCaml — full control over weights, gradients, and
+training loops. The interactive training mode (`--train`, `--prompt`/`--teach`)
+does real gradient steps on Mr. Classic's weights.
+
+Symbolic-eval asks a different question: can the symbolic layer we built for
+Vidya improve a model we didn't train? If yes, it validates the symbolic
+approach independently of our specific model. If the same constraints help
+both a 10M model we trained and a 3B model someone else trained, the technique
+generalises.
+
+The practical angle: a Llama 3.2 3B running on CPU with Vidya's symbolic
+layer and TD-learned weights could be a capable interactive system. The model
+provides generation quality. The symbolic layer provides adaptive refinement
+from human feedback. The context file provides multi-turn memory. No GPU
+needed for any of it.
+
+## Hardware Requirements
+
+For CPU-only inference with llama.cpp (16GB RAM system):
+- Llama 3.2 1B Q4: ~0.8GB, ~20-30 tok/s
+- Llama 3.2 3B Q4: ~2GB, ~8-12 tok/s (recommended sweet spot)
+- Phi-3.5 mini 3.8B Q4: ~2.5GB, ~6-10 tok/s
+- 7-8B Q4: ~5GB, ~2-4 tok/s (slow for interactive use)
+
 ## Structure
 
 ```
