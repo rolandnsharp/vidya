@@ -285,24 +285,15 @@ let encode tok doc =
     List.rev !result |> Array.of_list
   end
 
-(* decode: Convert token IDs back to text, skipping special tokens. *)
-let decode tok tokens =
-  let buf = Buffer.create 256 in
-  Array.iter (fun id ->
-    if id <> tok.bos_id && id <> tok.user_id && id <> tok.assistant_id then
-      Buffer.add_string buf tok.vocab.(id)
-  ) tokens;
-  String.trim (Buffer.contents buf)
-
-(* save_tokenizer: Save trained BPE tokenizer to binary file.
-   Avoids retraining from corpus on every invocation. *)
+(* Save the trained BPE tokenizer to a binary file using Marshal.
+   Subsequent runs can load it instantly instead of retraining. *)
 let save_tokenizer filename tok =
   let oc = open_out_bin filename in
   Marshal.to_channel oc (tok : t) [Marshal.No_sharing];
   close_out oc;
   Printf.printf "saved tokenizer to %s (%d vocab)\n%!" filename tok.vocab_size
 
-(* load_tokenizer: Load BPE tokenizer from binary file. *)
+(* Load a previously saved BPE tokenizer from a binary file. *)
 let load_tokenizer filename =
   let ic = open_in_bin filename in
   let tok : t = Marshal.from_channel ic in
