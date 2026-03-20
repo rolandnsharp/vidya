@@ -174,8 +174,8 @@ when isMainModule:
       let preNorm = gpu_grad_norm(addr gradPtrs[0], addr gradSizes[0], cint(params.len))
       if stepCount mod 50 == 0:
         echo &"  grad_norm: {preNorm:.2f}"
-      if preNorm != preNorm or preNorm > 1000.0:
-        echo &"  WARNING: bad gradient norm {preNorm:.2f} at step {stepCount}, skipping"
+      if preNorm != preNorm:
+        # Only skip on actual NaN — everything else gets clipped
         zeroGradV2()
         microStep = 0
         stepCount += 1
