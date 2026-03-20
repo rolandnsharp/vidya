@@ -4,11 +4,11 @@
 ## gradients, Adam updates weights. Loss should decrease.
 
 import gpu, gpu_model, autograd, ag_forward, bpe
-import std/[math, times, strformat, os]
+import std/[math, times, strformat, os, random]
 
 const
-  learningRate = 0.0001f
-  minLr = 0.00001f
+  learningRate = 0.00005f    # half the previous — stable longer
+  minLr = 0.000005f
   beta1 = 0.9f
   beta2 = 0.95f
   weightDecay = 0.1f
@@ -88,6 +88,13 @@ when isMainModule:
   echo &"  tokenized {tokenizedDocs.len} docs in {cpuTime() - t0:.2f}s"
 
   # Training
+  # Shuffle training data so each run sees different order
+  randomize()
+  var shuffled = newSeq[int](tokenizedDocs.len)
+  for i in 0 ..< shuffled.len: shuffled[i] = i
+  shuffle(shuffled)
+  echo "  shuffled document order"
+
   let numSteps = 200000
   echo &"training {numSteps} steps (grad_accum={gradAccumSteps}, effective_batch={gradAccumSteps})..."
   trackingEnabled = true
@@ -104,7 +111,8 @@ when isMainModule:
     gradSizes[i] = cint(params[i][].numel)
 
   for step in 0 ..< numSteps:
-    let tokens = tokenizedDocs[step mod tokenizedDocs.len]
+    let docIdx = shuffled[step mod shuffled.len]
+    let tokens = tokenizedDocs[docIdx]
     if tokens.len < 3: continue
 
     # Forward + loss (builds autograd graph)
@@ -130,11 +138,18 @@ when isMainModule:
         gpu_scale(params[i][].grad.data, 1.0f / float32(gradAccumSteps),
                   params[i][].grad.data, cint(params[i][].numel))
 
-      # Gradient clipping — log norm occasionally
+      # Gradient clipping — skip if NaN
       let preNorm = gpu_grad_norm(addr gradPtrs[0], addr gradSizes[0], cint(params.len))
-      clipGradNorm(gradPtrs, gradSizes, maxGradNorm)
       if stepCount mod 50 == 0:
         echo &"  grad_norm: {preNorm:.2f} → clipped to {maxGradNorm}"
+      if preNorm != preNorm or preNorm > 50.0:
+        # NaN or extreme gradient — zero grads and skip this step
+        echo &"  WARNING: bad gradient norm {preNorm:.2f} at step {stepCount}, skipping"
+        zeroGrad(params)
+        microStep = 0
+        stepCount += 1
+        continue
+      clipGradNorm(gradPtrs, gradSizes, maxGradNorm)
 
       # AdamW update with weight decay
       let lr = getLr(stepCount, numSteps div gradAccumSteps)

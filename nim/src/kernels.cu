@@ -41,6 +41,46 @@ void gpu_gelu_bwd(const float *x, const float *dy, float *dx, int n) {
     k_gelu_bwd<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(x, dy, dx, n);
 }
 
+/* ── SwiGLU ──────────────────────────────────────────────────────
+ *
+ * SwiGLU(gate, up) = swish(gate) * up
+ * where swish(x) = x * sigmoid(x)
+ *
+ * Replaces GELU in the FFN. Two input projections (gate and up)
+ * instead of one. Better empirically — used by Llama, Mistral, etc. */
+
+__global__ void k_swiglu_fwd(const float *gate, const float *up,
+                              float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float swish = g / (1.0f + expf(-g));
+    out[i] = swish * up[i];
+}
+
+__global__ void k_swiglu_bwd(const float *gate, const float *up,
+                              const float *dout,
+                              float *dgate, float *dup, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float sig = 1.0f / (1.0f + expf(-g));
+    float swish = g * sig;
+    float dswish = sig * (1.0f + g * (1.0f - sig));
+    dup[i] += dout[i] * swish;
+    dgate[i] += dout[i] * up[i] * dswish;
+}
+
+void gpu_swiglu_fwd(const float *gate, const float *up, float *out, int n) {
+    k_swiglu_fwd<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(gate, up, out, n);
+}
+
+void gpu_swiglu_bwd(const float *gate, const float *up, const float *dout,
+                    float *dgate, float *dup, int n) {
+    k_swiglu_bwd<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(
+        gate, up, dout, dgate, dup, n);
+}
+
 /* ── Element-wise ────────────────────────────────────────────────── */
 
 __global__ void k_add(const float *a, const float *b, float *y, int n) {

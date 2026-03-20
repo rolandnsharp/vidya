@@ -132,6 +132,17 @@ proc agRow*(mat: Node, rowIdx, cols: int): Node =
       cast[pointer](cast[int](mat.grad.data) + rowIdx * cols * sizeof(cfloat)),
       yGrad.data, cint(cols))
 
+proc agSwiGLU*(gate, up: Node): Node =
+  ## SwiGLU: swish(gate) * up. Used in FFN instead of GELU.
+  let n = gate.numel
+  let yBuf = trackedCreate(n)
+  gpu_swiglu_fwd(gate.data.data, up.data.data, yBuf.data, cint(n))
+  result = newNode(yBuf, n, @[gate, up])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    gpu_swiglu_bwd(gate.data.data, up.data.data, yGrad.data,
+                   gate.grad.data, up.grad.data, cint(n))
+
 proc agCrossEntropy*(logits: Node, target: int, vocabSize: int): Node =
   ## Fused softmax + NLL. Backward is (probs - one_hot), bounded [-1, 1].
   ## This avoids the 1/p gradient explosion from separate softmax + NLL.

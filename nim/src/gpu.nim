@@ -216,6 +216,10 @@ proc gpu_adamw*(param, grad, m, v: pointer,
   {.importc, cdecl.}
 proc gpu_elastic*(param, anchor: pointer, alpha: cfloat, n: cint)
   {.importc, cdecl.}
+proc gpu_swiglu_fwd*(gate, up, output: pointer, n: cint)
+  {.importc, cdecl.}
+proc gpu_swiglu_bwd*(gate, up, dout, dgate, dup: pointer, n: cint)
+  {.importc, cdecl.}
 proc gpu_zero_upper*(data: pointer, seq_len: cint)
   {.importc, cdecl.}
 
