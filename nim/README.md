@@ -7,6 +7,21 @@ One Nim binary. No Python. No PyTorch. Runs on NVIDIA (CUDA) today,
 [Tenstorrent Blackhole](https://tenstorrent.com) (TT-Metalium) tomorrow.
 Nim compiles to C and C++ — swap one file to target different silicon.
 
+## Usage
+
+```bash
+nimllm train data.txt          # train on a text file
+nimllm train --resume          # continue from last checkpoint
+nimllm chat                    # talk to it (retrains on every exchange)
+nimllm read notes.md           # read a document into the weights
+nimllm code                    # agent mode — runs shell commands
+```
+
+Every conversation is training data. Important things stick — facts that
+activate strong gradients survive. Small talk fades — weak gradients get
+pulled back to baseline by elastic weight consolidation. You don't manage
+memory. You just talk. The model figures out what matters.
+
 ## Quick Start
 
 ```bash
