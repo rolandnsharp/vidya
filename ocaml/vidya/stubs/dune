@@ -1,9 +1,16 @@
 (library
  (name vidya_stubs)
- (foreign_stubs (language c) (names blas_stubs)
+ (foreign_stubs (language c) (names blas_stubs gpu_bridge)
   (flags (:include c_flags.sexp)))
- (c_library_flags -lopenblas))
+ (extra_objects gpu_stubs)
+ (c_library_flags -lopenblas -lcublas -lcudart -lcurand -lstdc++))
 
 (rule
  (targets c_flags.sexp)
- (action (write-file c_flags.sexp "(-I/usr/include/x86_64-linux-gnu)")))
+ (action (write-file c_flags.sexp "(-I/usr/include/x86_64-linux-gnu -fPIC)")))
+
+; Compile gpu_stubs.cu → gpu_stubs.o with nvcc.
+(rule
+ (targets gpu_stubs.o)
+ (deps gpu_stubs.cu gpu_stubs.h)
+ (action (run nvcc -c -O2 -Xcompiler -fPIC -o %{targets} gpu_stubs.cu)))

@@ -1,3 +1,4 @@
 (executable
  (name main)
- (libraries vidya))
+ (libraries vidya)
+ (link_flags (-ccopt -Wl,--allow-multiple-definition)))

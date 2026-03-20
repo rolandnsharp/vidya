@@ -2,7 +2,8 @@
    ===================================================================
 
    Weight-tied, residual-scaled GPT-2 style transformer.
-   256-dim, 8 heads, 12 layers, 256-token context, ~9.6M params.
+   Wide-and-shallow 103M param architecture: 1024-dim, 16 heads,
+   8 layers, 512-token context.
 
    Weight tying: lm_head shares wte's matrix. The output projection
    logit for token t = dot(hidden, embedding[t]). Saves vocab_size ×
@@ -12,12 +13,12 @@
    std = 0.08 / sqrt(2 * n_layer). Each layer adds two residual
    connections; scaling keeps variance bounded at ~1x through the network. *)
 
-let n_layer = 12
-let n_embd = 256
-let block_size = 256
-let n_head = 8
-let head_dim = n_embd / n_head   (* = 32 *)
-let half_dim = head_dim / 2      (* = 16 *)
+let n_layer = 8
+let n_embd = 1024
+let block_size = 512
+let n_head = 16
+let head_dim = n_embd / n_head   (* = 64 *)
+let half_dim = head_dim / 2      (* = 32 *)
 
 (* RoPE (Rotary Position Embeddings) frequency tables.
    Precomputed for all positions and frequency indices. *)
