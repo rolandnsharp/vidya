@@ -75,7 +75,10 @@ when isMainModule:
     adamM[i] = gpuCreate(params[i][].numel)
     adamV[i] = gpuCreate(params[i][].numel)
 
-  # Tokenize data — cache to disk so we only do this once
+  # Tokenize data — use first 50K docs for speed.
+  # Full 2.4M would take hours to encode with 8K merges.
+  const maxTrainDocs = 50000
+
   let tokenCacheFile = vidyaRoot / "tokens_v2.bin"
   var tokenizedDocs: seq[seq[int32]]
 
@@ -92,18 +95,21 @@ when isMainModule:
     echo &"  loaded {tokenizedDocs.len} docs from cache"
   else:
     echo "tokenizing data (first run, will cache)..."
-    let docs = loadDocs(dataFile)
-    echo &"  {docs.len} docs"
+    let allDocs = loadDocs(dataFile)
+    let docs = if allDocs.len > maxTrainDocs: allDocs[0 ..< maxTrainDocs]
+               else: allDocs
+    echo &"  {docs.len} docs (of {allDocs.len} total)"
     let t0 = cpuTime()
-    for doc in docs:
+    for i, doc in docs:
       let ids = tok.encode(doc)
       var ids32 = newSeq[int32](ids.len)
-      for i in 0 ..< ids.len: ids32[i] = int32(ids[i])
+      for j in 0 ..< ids.len: ids32[j] = int32(ids[j])
       if ids32.len >= 3:
         tokenizedDocs.add(ids32)
+      if (i + 1) mod 10000 == 0:
+        echo &"    {i + 1}/{docs.len} tokenized"
     echo &"  tokenized {tokenizedDocs.len} docs in {cpuTime() - t0:.2f}s"
 
-    # Save cache
     echo "  saving token cache..."
     let s = newFileStream(tokenCacheFile, fmWrite)
     s.write(int32(tokenizedDocs.len))
@@ -168,7 +174,7 @@ when isMainModule:
       let preNorm = gpu_grad_norm(addr gradPtrs[0], addr gradSizes[0], cint(params.len))
       if stepCount mod 50 == 0:
         echo &"  grad_norm: {preNorm:.2f}"
-      if preNorm != preNorm or preNorm > 50.0:
+      if preNorm != preNorm or preNorm > 1000.0:
         echo &"  WARNING: bad gradient norm {preNorm:.2f} at step {stepCount}, skipping"
         zeroGradV2()
         microStep = 0
