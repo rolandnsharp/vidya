@@ -1,0 +1,233 @@
+## bpe.nim — Byte Pair Encoding tokenizer
+##
+## Trains on a corpus of text, learns 2000 merge rules, produces
+## a vocabulary of ~2188 tokens (185 byte-level + 2000 merges + 3 special).
+##
+## Can save/load to a portable binary format (not OCaml Marshal).
+
+import std/[tables, strutils, streams]
+
+const
+  nMerges* = 2000
+  bosToken* = "<|bos|>"
+  userToken* = "<|user|>"
+  assistantToken* = "<|assistant|>"
+
+type
+  MergeRule = tuple[a, b: int, merged: int]
+
+  Tokenizer* = object
+    vocab*: seq[string]          # id → string
+    tokenToId*: Table[string, int]
+    merges: seq[MergeRule]
+    bosId*: int
+    userId*: int
+    assistantId*: int
+
+# ── Build base vocabulary ─────────────────────────────────────────
+
+proc buildBaseVocab(): (seq[string], Table[string, int]) =
+  ## Create byte-level base vocabulary (all single chars found + specials).
+  var vocab: seq[string]
+  var tokenToId: Table[string, int]
+
+  # Add all printable ASCII + common bytes
+  for c in 0 .. 255:
+    let s = $chr(c)
+    if s.len > 0:
+      tokenToId[s] = vocab.len
+      vocab.add(s)
+
+  # Special tokens
+  for special in [bosToken, userToken, assistantToken]:
+    tokenToId[special] = vocab.len
+    vocab.add(special)
+
+  (vocab, tokenToId)
+
+# ── Training ──────────────────────────────────────────────────────
+
+proc countPairs(corpus: seq[seq[int]]): CountTable[(int, int)] =
+  ## Count adjacent token pairs across all documents.
+  result = initCountTable[(int, int)]()
+  for doc in corpus:
+    for i in 0 ..< doc.len - 1:
+      result.inc((doc[i], doc[i + 1]))
+
+proc mergePair(corpus: var seq[seq[int]], pair: (int, int), newId: int) =
+  ## Replace all occurrences of pair with newId in-place.
+  for doc in corpus.mitems:
+    var i = 0
+    var merged: seq[int]
+    while i < doc.len:
+      if i < doc.len - 1 and doc[i] == pair[0] and doc[i + 1] == pair[1]:
+        merged.add(newId)
+        i += 2
+      else:
+        merged.add(doc[i])
+        i += 1
+    doc = merged
+
+proc trainBpe*(docs: seq[string], numMerges: int = nMerges): Tokenizer =
+  ## Train BPE tokenizer on a corpus of documents.
+  var (vocab, tokenToId) = buildBaseVocab()
+  var merges: seq[MergeRule]
+
+  # Initial tokenization: each char becomes its byte-level token ID.
+  # Special tokens are handled as whole strings.
+  var corpus: seq[seq[int]]
+  for doc in docs:
+    var tokens: seq[int]
+    var i = 0
+    while i < doc.len:
+      # Check for special tokens
+      var matched = false
+      for special in [bosToken, userToken, assistantToken]:
+        if doc[i ..< min(i + special.len, doc.len)] == special:
+          tokens.add(tokenToId[special])
+          i += special.len
+          matched = true
+          break
+      if not matched:
+        let c = $doc[i]
+        if c in tokenToId:
+          tokens.add(tokenToId[c])
+        # else skip unknown byte
+        i += 1
+    corpus.add(tokens)
+
+  echo "training BPE: ", docs.len, " docs, base vocab: ", vocab.len
+
+  # Iteratively merge the most frequent pair
+  for m in 0 ..< numMerges:
+    let pairs = countPairs(corpus)
+    if pairs.len == 0:
+      break
+    let (bestPair, _) = pairs.largest()
+    let newId = vocab.len
+    let newToken = vocab[bestPair[0]] & vocab[bestPair[1]]
+    tokenToId[newToken] = newId
+    vocab.add(newToken)
+    merges.add((bestPair[0], bestPair[1], newId))
+    mergePair(corpus, bestPair, newId)
+
+    if (m + 1) mod 200 == 0:
+      echo "  merge ", m + 1, "/", numMerges, " vocab: ", vocab.len
+
+  result = Tokenizer(
+    vocab: vocab,
+    tokenToId: tokenToId,
+    merges: merges,
+    bosId: tokenToId[bosToken],
+    userId: tokenToId[userToken],
+    assistantId: tokenToId[assistantToken],
+  )
+
+# ── Encoding ──────────────────────────────────────────────────────
+
+proc encode*(tok: Tokenizer, text: string): seq[int] =
+  ## Encode text to token IDs using learned merges.
+  # Start with byte-level tokenization
+  var tokens: seq[int]
+  var i = 0
+  while i < text.len:
+    var matched = false
+    for special in [bosToken, userToken, assistantToken]:
+      if text[i ..< min(i + special.len, text.len)] == special:
+        tokens.add(tok.tokenToId[special])
+        i += special.len
+        matched = true
+        break
+    if not matched:
+      let c = $text[i]
+      if c in tok.tokenToId:
+        tokens.add(tok.tokenToId[c])
+      i += 1
+
+  # Apply merges in order
+  for merge in tok.merges:
+    var j = 0
+    var merged: seq[int]
+    while j < tokens.len:
+      if j < tokens.len - 1 and tokens[j] == merge.a and tokens[j + 1] == merge.b:
+        merged.add(merge.merged)
+        j += 2
+      else:
+        merged.add(tokens[j])
+        j += 1
+    tokens = merged
+
+  tokens
+
+proc decode*(tok: Tokenizer, ids: seq[int]): string =
+  ## Decode token IDs back to text.
+  for id in ids:
+    if id >= 0 and id < tok.vocab.len:
+      result.add(tok.vocab[id])
+
+# ── Save / Load (portable binary format) ─────────────────────────
+
+proc saveTokenizer*(tok: Tokenizer, filename: string) =
+  ## Save tokenizer to a portable binary format.
+  ## Format: vocab_size (int32), then for each token: len (int16) + bytes,
+  ## then num_merges (int32), then for each merge: a (int32) + b (int32) + merged (int32).
+  let s = newFileStream(filename, fmWrite)
+  defer: s.close()
+
+  # Vocab
+  s.write(int32(tok.vocab.len))
+  for token in tok.vocab:
+    s.write(int16(token.len))
+    s.writeData(token.cstring, token.len)
+
+  # Merges
+  s.write(int32(tok.merges.len))
+  for merge in tok.merges:
+    s.write(int32(merge.a))
+    s.write(int32(merge.b))
+    s.write(int32(merge.merged))
+
+proc loadTokenizer*(filename: string): Tokenizer =
+  ## Load tokenizer from portable binary format.
+  let s = newFileStream(filename, fmRead)
+  defer: s.close()
+
+  # Vocab
+  let vocabSize = s.readInt32().int
+  var vocab = newSeq[string](vocabSize)
+  var tokenToId = initTable[string, int]()
+  for i in 0 ..< vocabSize:
+    let len = s.readInt16().int
+    var buf = newString(len)
+    if len > 0:
+      discard s.readData(addr buf[0], len)
+    vocab[i] = buf
+    tokenToId[buf] = i
+
+  # Merges
+  let numMerges = s.readInt32().int
+  var merges = newSeq[MergeRule](numMerges)
+  for i in 0 ..< numMerges:
+    let a = s.readInt32().int
+    let b = s.readInt32().int
+    let merged = s.readInt32().int
+    merges[i] = (a, b, merged)
+
+  result = Tokenizer(
+    vocab: vocab,
+    tokenToId: tokenToId,
+    merges: merges,
+    bosId: tokenToId.getOrDefault(bosToken, 0),
+    userId: tokenToId.getOrDefault(userToken, 0),
+    assistantId: tokenToId.getOrDefault(assistantToken, 0),
+  )
+
+# ── Data loading ──────────────────────────────────────────────────
+
+proc loadDocs*(filename: string): seq[string] =
+  ## Load documents from a text file (one per line).
+  let content = readFile(filename)
+  for line in content.splitLines():
+    let trimmed = line.strip()
+    if trimmed.len > 0:
+      result.add(trimmed)
