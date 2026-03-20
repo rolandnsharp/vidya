@@ -78,6 +78,13 @@ type
     data*: pointer     ## cudaMalloc'd float32 device pointer
     numel*: int        ## number of float32 elements
 
+## Note on memory: GpuBuf does NOT auto-free. The forward pass creates
+## many temporaries per step. With auto-free, we'd need careful lifetime
+## management. Instead, we manually free with gpuFree when needed, and
+## let the process reclaim all GPU memory on exit.
+##
+## For training, we pre-allocate scratch buffers and reuse them.
+
 proc gpuCreate*(n: int): GpuBuf =
   ## Allocate n float32 elements on GPU, zero-initialised.
   result.numel = n
