@@ -377,6 +377,52 @@ void gpu_rope_bwd(float *grad, const float *cos_tab, const float *sin_tab,
         grad, cos_tab, sin_tab, seq_len, n_embd, n_head, head_dim, hd, -1);
 }
 
+/* ── GQA head extraction ─────────────────────────────────────────
+ *
+ * Q heads: extract normally (each Q head has its own slice)
+ * KV heads: fewer heads, each shared by kvRepeat Q heads.
+ * extract_kv_head extracts KV head (h / kvRepeat) for Q head h. */
+
+__global__ void k_extract_kv_head(const float *src, float *dst,
+                                   int qHead, int kvRepeat,
+                                   int seq_len, int n_kv_dim,
+                                   int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= seq_len * head_dim) return;
+    int pos = idx / head_dim;
+    int j = idx % head_dim;
+    int kvHead = qHead / kvRepeat;
+    dst[idx] = src[pos * n_kv_dim + kvHead * head_dim + j];
+}
+
+__global__ void k_insert_kv_head_acc(const float *src, float *dst,
+                                      int qHead, int kvRepeat,
+                                      int seq_len, int n_kv_dim,
+                                      int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= seq_len * head_dim) return;
+    int pos = idx / head_dim;
+    int j = idx % head_dim;
+    int kvHead = qHead / kvRepeat;
+    atomicAdd(&dst[pos * n_kv_dim + kvHead * head_dim + j], src[idx]);
+}
+
+void gpu_extract_kv_head(const float *src, float *dst,
+                         int qHead, int kvRepeat,
+                         int seq_len, int n_kv_dim, int head_dim) {
+    int n = seq_len * head_dim;
+    k_extract_kv_head<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(
+        src, dst, qHead, kvRepeat, seq_len, n_kv_dim, head_dim);
+}
+
+void gpu_insert_kv_head_acc(const float *src, float *dst,
+                            int qHead, int kvRepeat,
+                            int seq_len, int n_kv_dim, int head_dim) {
+    int n = seq_len * head_dim;
+    k_insert_kv_head_acc<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(
+        src, dst, qHead, kvRepeat, seq_len, n_kv_dim, head_dim);
+}
+
 /* ── Embedding ───────────────────────────────────────────────────── */
 
 __global__ void k_embed_fwd(const float *wte, const int *tokens,

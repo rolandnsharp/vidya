@@ -52,6 +52,11 @@ proc paramNode*(p: GpuParam): Node =
   Node(id: freshId(), data: p.data, grad: p.grad,
        numel: p.numel, children: @[], backwardFn: nil)
 
+proc paramNode*(data, grad: GpuBuf, numel: int): Node =
+  ## Generic version: wrap any data/grad pair as a leaf node.
+  Node(id: freshId(), data: data, grad: grad,
+       numel: numel, children: @[], backwardFn: nil)
+
 # ── Operations ────────────────────────────────────────────────────
 # Pattern: create node, capture its grad by let binding, set backwardFn.
 
