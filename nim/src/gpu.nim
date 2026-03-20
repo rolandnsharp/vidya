@@ -276,6 +276,18 @@ proc adamStep*(param, grad, m, v: GpuBuf,
 proc elasticPull*(param, anchor: GpuBuf, alpha: float32) =
   gpu_elastic(param.data, anchor.data, alpha, cint(param.numel))
 
+# ── Gradient clipping (GPU-side) ──────────────────────────────────
+
+proc gpu_grad_norm*(grads: ptr pointer, sizes: ptr cint, n: cint): cfloat
+  {.importc, cdecl.}
+proc gpu_clip_grads*(grads: ptr pointer, sizes: ptr cint, n: cint, max_norm: cfloat)
+  {.importc, cdecl.}
+
+proc clipGradNorm*(gradPtrs: var seq[pointer], sizes: var seq[cint],
+                   maxNorm: float32) =
+  ## Clip global gradient norm. Caller prepares pointer/size arrays.
+  gpu_clip_grads(addr gradPtrs[0], addr sizes[0], cint(gradPtrs.len), maxNorm)
+
 # ── NLL (scalar return) ───────────────────────────────────────────
 
 proc gpu_nll_fwd*(probs: pointer, target: cint): cfloat =

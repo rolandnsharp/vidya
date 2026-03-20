@@ -7,6 +7,26 @@
 import gpu, gpu_model
 import std/[tables, math]
 
+# ── Allocation tracking ───────────────────────────────────────────
+# Track all GPU allocations made during a training step so we can
+# free them all at once. This catches temporaries inside backward
+# closures that the graph walk would miss.
+
+var stepAllocations*: seq[GpuBuf]
+var trackingEnabled* = false
+
+proc trackedCreate*(n: int): GpuBuf =
+  ## Like gpuCreate but registers the buffer for cleanup.
+  result = gpuCreate(n)
+  if trackingEnabled:
+    stepAllocations.add(result)
+
+proc freeStepAllocations*() =
+  ## Free all GPU buffers allocated during this step.
+  for i in 0 ..< stepAllocations.len:
+    gpuFree(stepAllocations[i])
+  stepAllocations.setLen(0)
+
 type
   BackwardFn* = proc() {.closure.}
 
@@ -24,7 +44,7 @@ proc freshId(): int =
 
 proc newNode*(data: GpuBuf, numel: int, children: seq[Node] = @[],
               bwd: BackwardFn = nil): Node =
-  Node(id: freshId(), data: data, grad: gpuCreate(numel),
+  Node(id: freshId(), data: data, grad: trackedCreate(numel),
        numel: numel, children: children, backwardFn: bwd)
 
 proc paramNode*(p: GpuParam): Node =
@@ -37,7 +57,7 @@ proc paramNode*(p: GpuParam): Node =
 
 proc agMatmul*(w, x: Node, s, m, n: int): Node =
   ## y[s,m] = x[s,n] @ w[m,n]^T
-  let yBuf = gpuCreate(s * m)
+  let yBuf = trackedCreate(s * m)
   gpuSgemm(2, s, m, n, x.data, w.data, yBuf)
   result = newNode(yBuf, s * m, @[w, x])
   let yGrad = result.grad
@@ -47,7 +67,7 @@ proc agMatmul*(w, x: Node, s, m, n: int): Node =
 
 proc agAdd*(a, b: Node): Node =
   let n = a.numel
-  let yBuf = gpuCreate(n)
+  let yBuf = trackedCreate(n)
   gpu_add(a.data.data, b.data.data, yBuf.data, cint(n))
   result = newNode(yBuf, n, @[a, b])
   let yGrad = result.grad
@@ -57,7 +77,7 @@ proc agAdd*(a, b: Node): Node =
 
 proc agGelu*(x: Node): Node =
   let n = x.numel
-  let yBuf = gpuCreate(n)
+  let yBuf = trackedCreate(n)
   geluFwd(x.data, yBuf)
   result = newNode(yBuf, n, @[x])
   let yGrad = result.grad
@@ -66,8 +86,8 @@ proc agGelu*(x: Node): Node =
 
 proc agRmsNormAffine*(x, gamma: Node, rows, dim: int): Node =
   let n = rows * dim
-  let yBuf = gpuCreate(n)
-  let rmsBuf = gpuCreate(rows)
+  let yBuf = trackedCreate(n)
+  let rmsBuf = trackedCreate(rows)
   rmsnormAffineFwd(x.data, gamma.data, yBuf, rmsBuf, rows, dim)
   result = newNode(yBuf, n, @[x, gamma])
   let yGrad = result.grad
@@ -77,7 +97,7 @@ proc agRmsNormAffine*(x, gamma: Node, rows, dim: int): Node =
 
 proc agSoftmax*(x: Node, rows, cols: int): Node =
   let n = rows * cols
-  let yBuf = gpuCreate(n)
+  let yBuf = trackedCreate(n)
   softmaxFwd(x.data, yBuf, rows, cols)
   result = newNode(yBuf, n, @[x])
   let yData = result.data
@@ -87,7 +107,7 @@ proc agSoftmax*(x: Node, rows, cols: int): Node =
 
 proc agEmbed*(wte: Node, tokenIds: seq[int32], seqLen, dim: int): Node =
   let n = seqLen * dim
-  let yBuf = gpuCreate(n)
+  let yBuf = trackedCreate(n)
   var tokBuf: pointer
   discard cudaMalloc(addr tokBuf, csize_t(seqLen * sizeof(int32)))
   discard cudaMemcpy(tokBuf, unsafeAddr tokenIds[0],
@@ -100,7 +120,7 @@ proc agEmbed*(wte: Node, tokenIds: seq[int32], seqLen, dim: int): Node =
     # Note: tokBuf leaks — need to free after backward. TODO: cleanup list.
 
 proc agRow*(mat: Node, rowIdx, cols: int): Node =
-  let yBuf = gpuCreate(cols)
+  let yBuf = trackedCreate(cols)
   discard cudaMemcpy(yBuf.data,
     cast[pointer](cast[int](mat.data.data) + rowIdx * cols * sizeof(cfloat)),
     csize_t(cols * sizeof(cfloat)), CudaMemcpyDeviceToDevice)
@@ -114,7 +134,7 @@ proc agRow*(mat: Node, rowIdx, cols: int): Node =
 
 proc agNll*(probs: Node, target: int, vocabSize: int): Node =
   let lossVal = gpu_nll_fwd(probs.data.data, cint(target))
-  let yBuf = gpuCreate(1)
+  let yBuf = trackedCreate(1)
   gpuUpload(yBuf, @[lossVal])
   result = newNode(yBuf, 1, @[probs])
   let yGrad = result.grad
@@ -134,20 +154,20 @@ proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
   let hd = headDim
   let scale = 1.0f / sqrt(float32(hd))
 
-  let qRot = gpuCreate(seqLen * n)
+  let qRot = trackedCreate(seqLen * n)
   gpuCopy(q.data, qRot, seqLen * n)
-  let kRot = gpuCreate(seqLen * n)
+  let kRot = trackedCreate(seqLen * n)
   gpuCopy(k.data, kRot, seqLen * n)
   ropeFwd(qRot, ropeCos, ropeSin, seqLen, n, nHead, hd)
   ropeFwd(kRot, ropeCos, ropeSin, seqLen, n, nHead, hd)
 
-  let outBuf = gpuCreate(seqLen * n)
-  let qH = gpuCreate(seqLen * hd)
-  let kH = gpuCreate(seqLen * hd)
-  let vH = gpuCreate(seqLen * hd)
-  let scores = gpuCreate(seqLen * seqLen)
-  let weights = gpuCreate(seqLen * seqLen)
-  let attnH = gpuCreate(seqLen * hd)
+  let outBuf = trackedCreate(seqLen * n)
+  let qH = trackedCreate(seqLen * hd)
+  let kH = trackedCreate(seqLen * hd)
+  let vH = trackedCreate(seqLen * hd)
+  let scores = trackedCreate(seqLen * seqLen)
+  let weights = trackedCreate(seqLen * seqLen)
+  let attnH = trackedCreate(seqLen * hd)
 
   var allWeights = newSeq[GpuBuf](nHead)
   for h in 0 ..< nHead:
@@ -157,7 +177,7 @@ proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
     gpuSgemm(2, seqLen, seqLen, hd, qH, kH, scores)
     causalMask(scores, scale, seqLen)
     softmaxFwd(scores, weights, seqLen, seqLen)
-    allWeights[h] = gpuCreate(seqLen * seqLen)
+    allWeights[h] = trackedCreate(seqLen * seqLen)
     gpuCopy(weights, allWeights[h], seqLen * seqLen)
     gpuSgemm(0, seqLen, hd, seqLen, weights, vH, attnH)
     insertHead(attnH, outBuf, h, seqLen, n, hd)
@@ -165,13 +185,13 @@ proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
   result = newNode(outBuf, seqLen * n, @[q, k, v])
   let outGrad = result.grad
   result.backwardFn = proc() =
-    let dqRot = gpuCreate(seqLen * n)
-    let dkRot = gpuCreate(seqLen * n)
-    let doutH = gpuCreate(seqLen * hd)
-    let dvH = gpuCreate(seqLen * hd)
-    let dw = gpuCreate(seqLen * seqLen)
-    let dqH = gpuCreate(seqLen * hd)
-    let dkH = gpuCreate(seqLen * hd)
+    let dqRot = trackedCreate(seqLen * n)
+    let dkRot = trackedCreate(seqLen * n)
+    let doutH = trackedCreate(seqLen * hd)
+    let dvH = trackedCreate(seqLen * hd)
+    let dw = trackedCreate(seqLen * seqLen)
+    let dqH = trackedCreate(seqLen * hd)
+    let dkH = trackedCreate(seqLen * hd)
 
     for h in 0 ..< nHead:
       extractHead(outGrad, doutH, h, seqLen, n, hd)
@@ -215,3 +235,21 @@ proc backward*(loss: Node) =
 
 proc zeroGrad*(params: seq[ptr GpuParam]) =
   for p in params: gpuZero(p[].grad)
+
+# ── Cleanup ───────────────────────────────────────────────────────
+
+proc freeGraph*(loss: Node) =
+  ## Free all intermediate GPU buffers in the autograd graph.
+  ## Does NOT free paramNode buffers (they're owned by the model).
+  ## Call this after each training step to reclaim VRAM.
+  var visited = initTable[int, bool]()
+  proc walk(node: Node) =
+    if node.id in visited: return
+    visited[node.id] = true
+    for child in node.children: walk(child)
+    # Only free if this node owns its buffers (not a param node).
+    # Param nodes have children.len == 0 and backwardFn == nil.
+    if node.backwardFn != nil:
+      gpuFree(node.data)
+      gpuFree(node.grad)
+  walk(loss)

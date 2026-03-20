@@ -401,4 +401,54 @@ void gpu_elastic(float *param, const float *anchor, float alpha, int n) {
     k_elastic<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(param, anchor, alpha, n);
 }
 
+/* ── Gradient norm + clipping ─────────────────────────────────────── */
+
+/* Compute sum of squares of a float array. Returns scalar on host. */
+__global__ void k_sum_sq(const float *data, float *out, int n) {
+    extern __shared__ float sdata[];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (idx < n) ? data[idx] * data[idx] : 0.0f;
+    sdata[threadIdx.x] = val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s)
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        atomicAdd(out, sdata[0]);
+}
+
+float gpu_grad_norm(const float **grads, const int *sizes, int n_tensors) {
+    /* Allocate a single float on device for accumulation. */
+    float *d_sum;
+    cudaMalloc(&d_sum, sizeof(float));
+    cudaMemset(d_sum, 0, sizeof(float));
+
+    for (int t = 0; t < n_tensors; t++) {
+        int n = sizes[t];
+        int blocks = (n + BLOCK - 1) / BLOCK;
+        k_sum_sq<<<blocks, BLOCK, BLOCK * sizeof(float)>>>(
+            grads[t], d_sum, n);
+    }
+
+    float h_sum;
+    cudaMemcpy(&h_sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_sum);
+    return sqrtf(h_sum);
+}
+
+void gpu_clip_grads(float **grads, const int *sizes, int n_tensors,
+                    float max_norm) {
+    float norm = gpu_grad_norm((const float **)grads, sizes, n_tensors);
+    if (norm > max_norm) {
+        float scale = max_norm / norm;
+        for (int t = 0; t < n_tensors; t++) {
+            int n = sizes[t];
+            k_scale<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(
+                grads[t], scale, grads[t], n);
+        }
+    }
+}
+
 } /* extern "C" */

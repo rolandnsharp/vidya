@@ -7,12 +7,13 @@ import gpu, gpu_model, autograd, ag_forward, bpe
 import std/[math, times, strformat, os]
 
 const
-  learningRate = 0.0003f
+  learningRate = 0.00002f  # very conservative — batch size 1 is noisy
   beta1 = 0.9f
   beta2 = 0.999f
-  warmupSteps = 5000
+  warmupSteps = 200
   logInterval = 50
   checkpointInterval = 2500
+  maxGradNorm = 1.0f
 
 proc formatDuration(secs: float): string =
   let h = int(secs) div 3600
@@ -79,6 +80,7 @@ when isMainModule:
   # Training
   let numSteps = 200000
   echo &"training {numSteps} steps..."
+  trackingEnabled = true
   let tStart = cpuTime()
   var lossSum = 0.0f
   var stepCount = 0
@@ -90,13 +92,25 @@ when isMainModule:
     # Zero gradients
     zeroGrad(params)
 
-    # Forward + loss (builds autograd graph)
+    # Forward + loss (builds autograd graph, all allocs tracked)
     let (lossNode, lossVal) = agComputeLoss(m, tokens)
-    if lossNode == nil: continue
-    if lossVal != lossVal or lossVal > 100: continue
+    if lossNode == nil:
+      freeStepAllocations()
+      continue
+    if lossVal != lossVal or lossVal > 100:
+      freeStepAllocations()
+      continue
 
-    # Backward (propagates gradients through graph)
+    # Backward (propagates gradients, may allocate more tracked buffers)
     backward(lossNode)
+
+    # Gradient clipping — proper L2 norm on GPU, clip to maxGradNorm
+    var gradPtrs = newSeq[pointer](params.len)
+    var gradSizes = newSeq[cint](params.len)
+    for i in 0 ..< params.len:
+      gradPtrs[i] = params[i][].grad.data
+      gradSizes[i] = cint(params[i][].numel)
+    clipGradNorm(gradPtrs, gradSizes, maxGradNorm)
 
     # Adam update
     let lr = getLr(step, numSteps)
@@ -105,6 +119,9 @@ when isMainModule:
     for i in 0 ..< params.len:
       adamStep(params[i][].data, params[i][].grad, adamM[i], adamV[i],
                lr, beta1, beta2, bc1, bc2)
+
+    # Free ALL intermediate GPU buffers from this step
+    freeStepAllocations()
 
     lossSum += lossVal
     stepCount += 1
