@@ -242,12 +242,21 @@ proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
       # dV += Weights^T @ dAttn
       gpuSgemm(4, seqLen, hd, seqLen, allWeights[h], doutH, dvH)
       insertHeadAcc(dvH, v.grad, h, seqLen, n, hd)
-      # Softmax backward into separate buffer (no aliasing)
-      softmaxBwd(allWeights[h], dw, dScores, seqLen, seqLen)
-      # Apply scale (was applied in forward before softmax)
-      gpu_scale(dScores.data, scale, dScores.data, cint(seqLen * seqLen))
-      # Zero upper triangle of gradient (causal mask)
-      gpu_zero_upper(dScores.data, cint(seqLen))
+      # Causal softmax backward — matches OCaml implementation exactly.
+      # CPU-side for correctness. Only processes lower triangle.
+      let dwCpu = gpuDownload(dw)
+      let wtCpu = gpuDownload(allWeights[h])
+      var dScoresCpu = newSeq[float32](seqLen * seqLen)
+      for i in 0 ..< seqLen:
+        var dot = 0.0f
+        for j in 0 .. i:
+          dot += dwCpu[i * seqLen + j] * wtCpu[i * seqLen + j]
+        for j in 0 .. i:
+          dScoresCpu[i * seqLen + j] =
+            wtCpu[i * seqLen + j] * (dwCpu[i * seqLen + j] - dot) * scale
+        for j in i + 1 ..< seqLen:
+          dScoresCpu[i * seqLen + j] = 0.0f
+      gpuUpload(dScores, dScoresCpu)
       # dQ_rot += dScores @ K_rot
       extractHead(kRot, kH, h, seqLen, n, hd)
       gpuSgemm(0, seqLen, hd, seqLen, dScores, kH, dqH)

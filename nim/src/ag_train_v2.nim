@@ -1,10 +1,10 @@
 ## ag_train_v2.nim — V2 training: GQA + SwiGLU + dropout + big data
 
 import gpu, model_v2, autograd, ag_forward_v2, bpe
-import std/[math, times, strformat, os, random]
+import std/[math, times, strformat, os, random, streams]
 
 const
-  learningRate = 0.0003f   # can go higher with dropout + batch 8
+  learningRate = 0.0001f   # conservative — proven stable in V1 up to step 3800
   minLr = 0.00003f
   beta1 = 0.9f
   beta2 = 0.95f
@@ -14,7 +14,7 @@ const
   logInterval = 50
   checkpointInterval = 2500
   maxGradNorm = 1.0f
-  bpeMerges = 8000         # larger vocab for V2
+  bpeMerges = 4000         # good enough — retrain on books later
 
 proc formatDuration(secs: float): string =
   let h = int(secs) div 3600
@@ -75,19 +75,43 @@ when isMainModule:
     adamM[i] = gpuCreate(params[i][].numel)
     adamV[i] = gpuCreate(params[i][].numel)
 
-  # Data — stream from file, don't load all 2.5GB into RAM
-  echo "loading and tokenizing data..."
-  let docs = loadDocs(dataFile)
-  echo &"  {docs.len} docs"
-  let t0 = cpuTime()
+  # Tokenize data — cache to disk so we only do this once
+  let tokenCacheFile = vidyaRoot / "tokens_v2.bin"
   var tokenizedDocs: seq[seq[int32]]
-  for doc in docs:
-    let ids = tok.encode(doc)
-    var ids32 = newSeq[int32](ids.len)
-    for i in 0 ..< ids.len: ids32[i] = int32(ids[i])
-    if ids32.len >= 3:
-      tokenizedDocs.add(ids32)
-  echo &"  tokenized {tokenizedDocs.len} docs in {cpuTime() - t0:.2f}s"
+
+  if fileExists(tokenCacheFile):
+    echo "loading cached tokens from ", tokenCacheFile, "..."
+    let s = newFileStream(tokenCacheFile, fmRead)
+    let nDocs = s.readInt32().int
+    for i in 0 ..< nDocs:
+      let n = s.readInt32().int
+      var ids = newSeq[int32](n)
+      for j in 0 ..< n: ids[j] = s.readInt32()
+      tokenizedDocs.add(ids)
+    s.close()
+    echo &"  loaded {tokenizedDocs.len} docs from cache"
+  else:
+    echo "tokenizing data (first run, will cache)..."
+    let docs = loadDocs(dataFile)
+    echo &"  {docs.len} docs"
+    let t0 = cpuTime()
+    for doc in docs:
+      let ids = tok.encode(doc)
+      var ids32 = newSeq[int32](ids.len)
+      for i in 0 ..< ids.len: ids32[i] = int32(ids[i])
+      if ids32.len >= 3:
+        tokenizedDocs.add(ids32)
+    echo &"  tokenized {tokenizedDocs.len} docs in {cpuTime() - t0:.2f}s"
+
+    # Save cache
+    echo "  saving token cache..."
+    let s = newFileStream(tokenCacheFile, fmWrite)
+    s.write(int32(tokenizedDocs.len))
+    for doc in tokenizedDocs:
+      s.write(int32(doc.len))
+      for id in doc: s.write(id)
+    s.close()
+    echo "  cached to ", tokenCacheFile
 
   # Shuffle
   randomize()

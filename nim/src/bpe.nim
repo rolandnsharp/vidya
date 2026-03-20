@@ -5,7 +5,7 @@
 ##
 ## Can save/load to a portable binary format (not OCaml Marshal).
 
-import std/[tables, strutils, streams]
+import std/[tables, strutils, streams, strformat]
 
 const
   nMerges* = 2000
@@ -68,19 +68,26 @@ proc mergePair(corpus: var seq[seq[int]], pair: (int, int), newId: int) =
         i += 1
     doc = merged
 
-proc trainBpe*(docs: seq[string], numMerges: int = nMerges): Tokenizer =
+proc trainBpe*(docs: seq[string], numMerges: int = nMerges,
+               maxDocs: int = 50000): Tokenizer =
   ## Train BPE tokenizer on a corpus of documents.
+  ## Subsamples to maxDocs for speed — 50K docs gives the same vocab.
   var (vocab, tokenToId) = buildBaseVocab()
   var merges: seq[MergeRule]
 
+  # Subsample if corpus is too large — BPE vocab converges fast
+  var trainDocs = docs
+  if docs.len > maxDocs:
+    echo &"  subsampling {maxDocs} of {docs.len} docs for BPE training"
+    trainDocs = docs[0 ..< maxDocs]
+
   # Initial tokenization: each char becomes its byte-level token ID.
-  # Special tokens are handled as whole strings.
+  echo &"  tokenizing {trainDocs.len} docs for BPE..."
   var corpus: seq[seq[int]]
-  for doc in docs:
+  for idx, doc in trainDocs:
     var tokens: seq[int]
     var i = 0
     while i < doc.len:
-      # Check for special tokens
       var matched = false
       for special in [bosToken, userToken, assistantToken]:
         if doc[i ..< min(i + special.len, doc.len)] == special:
@@ -92,11 +99,12 @@ proc trainBpe*(docs: seq[string], numMerges: int = nMerges): Tokenizer =
         let c = $doc[i]
         if c in tokenToId:
           tokens.add(tokenToId[c])
-        # else skip unknown byte
         i += 1
     corpus.add(tokens)
+    if (idx + 1) mod 10000 == 0:
+      echo &"    {idx + 1}/{trainDocs.len} docs tokenized"
 
-  echo "training BPE: ", docs.len, " docs, base vocab: ", vocab.len
+  echo "training BPE: ", trainDocs.len, " docs (of ", docs.len, " total), base vocab: ", vocab.len
 
   # Iteratively merge the most frequent pair
   for m in 0 ..< numMerges:
@@ -111,7 +119,7 @@ proc trainBpe*(docs: seq[string], numMerges: int = nMerges): Tokenizer =
     merges.add((bestPair[0], bestPair[1], newId))
     mergePair(corpus, bestPair, newId)
 
-    if (m + 1) mod 200 == 0:
+    if (m + 1) mod 100 == 0:
       echo "  merge ", m + 1, "/", numMerges, " vocab: ", vocab.len
 
   result = Tokenizer(

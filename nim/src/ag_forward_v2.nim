@@ -110,10 +110,20 @@ proc agGqaAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
                              cint(h), cint(kvRepeatV2),
                              cint(seqLen), cint(nKvDim), cint(hd))
 
-      # Softmax backward
-      softmaxBwd(allWeights[h], dw, dScores, seqLen, seqLen)
-      gpu_scale(dScores.data, scale, dScores.data, cint(seqLen * seqLen))
-      gpu_zero_upper(dScores.data, cint(seqLen))
+      # Causal softmax backward — CPU-side, matches OCaml exactly
+      let dwCpu = gpuDownload(dw)
+      let wtCpu = gpuDownload(allWeights[h])
+      var dScoresCpu = newSeq[float32](seqLen * seqLen)
+      for i in 0 ..< seqLen:
+        var dot = 0.0f
+        for j in 0 .. i:
+          dot += dwCpu[i * seqLen + j] * wtCpu[i * seqLen + j]
+        for j in 0 .. i:
+          dScoresCpu[i * seqLen + j] =
+            wtCpu[i * seqLen + j] * (dwCpu[i * seqLen + j] - dot) * scale
+        for j in i + 1 ..< seqLen:
+          dScoresCpu[i * seqLen + j] = 0.0f
+      gpuUpload(dScores, dScoresCpu)
 
       # dQ_rot += dScores @ K_rot
       gpu_extract_kv_head(kRot.data, kH.data,

@@ -74,7 +74,7 @@ proc makeOnesParam(n: int): GpuParam =
 proc initGpuModel*(vocabSize: int): GpuModel =
   ## Create 103M parameter model with all weights on GPU.
   randomize(42)
-  let residualStd = 0.08f / sqrt(float32(2 * nLayer))
+  let residualStd = 0.02f / sqrt(float32(2 * nLayer))
 
   echo "  uploading wte..."
   result.vocabSize = vocabSize
