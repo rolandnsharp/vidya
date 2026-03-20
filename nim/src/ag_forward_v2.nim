@@ -7,6 +7,23 @@
 import gpu, model_v2, autograd
 import std/math
 
+var trainingMode* = true
+
+# ── Dropout ───────────────────────────────────────────────────────
+
+proc agDropout*(x: Node, rate: float32 = 0.1f): Node =
+  ## Randomly zero elements during training. No-op during inference.
+  if not trainingMode or rate == 0.0f:
+    return x
+  let n = x.numel
+  let mask = trackedCreate(n)
+  let yBuf = trackedCreate(n)
+  gpu_dropout_fwd(x.data.data, yBuf.data, mask.data, rate, cint(n))
+  result = newNode(yBuf, n, @[x])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    gpu_dropout_bwd(yGrad.data, mask.data, x.grad.data, cint(n))
+
 # ── GQA Attention ─────────────────────────────────────────────────
 
 proc agGqaAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
@@ -142,7 +159,7 @@ proc agTransformerBlockV2*(x: Node, layer: GpuLayerV2,
   let k = agMatmul(wk, xn, seqLen, nKvDim, n)     # fewer KV heads
   let v = agMatmul(wv, xn, seqLen, nKvDim, n)     # fewer KV heads
   let attnOut = agGqaAttention(q, k, v, ropeCos, ropeSin, seqLen)
-  let projected = agMatmul(wo, attnOut, seqLen, n, n)
+  let projected = agDropout(agMatmul(wo, attnOut, seqLen, n, n))
   let afterAttn = agAdd(x, projected)
 
   # SwiGLU MLP sub-block
@@ -150,5 +167,57 @@ proc agTransformerBlockV2*(x: Node, layer: GpuLayerV2,
   let gate = agMatmul(wgate, xn2, seqLen, ffnDimV2, n)
   let up = agMatmul(wup, xn2, seqLen, ffnDimV2, n)
   let hidden = agSwiGLU(gate, up)
-  let mlpOut = agMatmul(wdown, hidden, seqLen, n, ffnDimV2)
+  let mlpOut = agDropout(agMatmul(wdown, hidden, seqLen, n, ffnDimV2))
   agAdd(afterAttn, mlpOut)
+
+# ── Full V2 forward pass ─────────────────────────────────────────
+
+proc agForwardV2*(m: var GpuModelV2, tokenIds: seq[int32],
+                  seqLen: int): Node =
+  let n = nEmbdV2
+  let wte = paramNode(m.wte.data, m.wte.grad, m.wte.numel)
+  let embedNorm = paramNode(m.embedNorm.data, m.embedNorm.grad, m.embedNorm.numel)
+  let finalNorm = paramNode(m.finalNorm.data, m.finalNorm.grad, m.finalNorm.numel)
+
+  # Embedding
+  var x = agEmbed(wte, tokenIds, seqLen, n)
+  x = agRmsNormAffine(x, embedNorm, seqLen, n)
+  x = agDropout(x)
+
+  # Transformer layers
+  for i in 0 ..< nLayerV2:
+    x = agTransformerBlockV2(x, m.layers[i], m.ropeCos, m.ropeSin, seqLen)
+
+  # Final norm + project to vocab (weight-tied)
+  x = agRmsNormAffine(x, finalNorm, seqLen, n)
+  agMatmul(wte, x, seqLen, m.vocabSize, n)
+
+proc agComputeLossV2*(m: var GpuModelV2, tokens: seq[int32]): (Node, float32) =
+  let seqLen = min(blockSizeV2, tokens.len - 1)
+  if seqLen < 2: return (nil, 0.0f)
+
+  let logits = agForwardV2(m, tokens[0 ..< seqLen], seqLen)
+
+  var losses: seq[Node]
+  for i in 0 ..< seqLen:
+    let logitsI = agRow(logits, i, m.vocabSize)
+    let ce = agCrossEntropy(logitsI, tokens[i + 1].int, m.vocabSize)
+    losses.add(ce)
+
+  var totalLoss = 0.0f
+  for l in losses:
+    let v = gpuDownload(l.data)
+    totalLoss += v[0]
+  let meanLoss = totalLoss / float32(seqLen)
+
+  let meanBuf = trackedCreate(1)
+  gpuUpload(meanBuf, @[meanLoss])
+  let meanNode = newNode(meanBuf, 1, losses)
+  let mGrad = meanNode.grad
+  let sl = seqLen
+  meanNode.backwardFn = proc() =
+    let dy = gpuDownload(mGrad)
+    let scale = dy[0] / float32(sl)
+    for l in losses:
+      gpuUpload(l.grad, @[scale])
+  (meanNode, meanLoss)

@@ -66,18 +66,136 @@ proc paramCountV2*(m: GpuModelV2): int =
     result += layer.mlpWgate.numel + layer.mlpWup.numel + layer.mlpWdown.numel
     result += layer.ln1.numel + layer.ln2.numel
 
-## Parameter count estimate:
-##   wte: vocab * 768
-##   Per layer:
-##     Q: 768*768 = 589K
-##     K: 256*768 = 196K (4 KV heads * 64)
-##     V: 256*768 = 196K
-##     O: 768*768 = 589K
-##     gate: 2048*768 = 1.57M
-##     up: 2048*768 = 1.57M
-##     down: 768*2048 = 1.57M
-##     norms: 2*768 = 1.5K
-##     total per layer: ~6.3M
-##   12 layers: ~75M
-##   embeddings (8K vocab): ~6M
-##   Total: ~81M (need to bump ffnDim to hit 135M)
+proc randomNormalV2(n: int, std: float32): seq[float32] =
+  result = newSeq[float32](n)
+  var i = 0
+  while i < n - 1:
+    let u1 = rand(1.0).float32
+    let u2 = rand(1.0).float32
+    let mag = std * sqrt(-2.0f * ln(max(u1, 1e-10f)))
+    result[i]     = mag * cos(2.0f * PI.float32 * u2)
+    result[i + 1] = mag * sin(2.0f * PI.float32 * u2)
+    i += 2
+  if i < n:
+    let u1 = rand(1.0).float32
+    let u2 = rand(1.0).float32
+    result[i] = std * sqrt(-2.0f * ln(max(u1, 1e-10f))) * cos(2.0f * PI.float32 * u2)
+
+proc makeParamV2(n: int, std: float32 = 0.02f): GpuParamV2 =
+  let hostData = randomNormalV2(n, std)
+  result.numel = n
+  result.data = toGpu(hostData)
+  result.grad = gpuCreate(n)
+
+proc makeOnesParamV2(n: int): GpuParamV2 =
+  var hostData = newSeq[float32](n)
+  for i in 0 ..< n: hostData[i] = 1.0f
+  result.numel = n
+  result.data = toGpu(hostData)
+  result.grad = gpuCreate(n)
+
+proc initGpuModelV2*(vocabSize: int): GpuModelV2 =
+  randomize(42)
+  let residualStd = 0.02f / sqrt(float32(2 * nLayerV2))
+  let nKvDim = nKvHeadV2 * headDimV2
+
+  echo "  uploading wte..."
+  result.vocabSize = vocabSize
+  result.wte = makeParamV2(vocabSize * nEmbdV2)
+  result.embedNorm = makeOnesParamV2(nEmbdV2)
+  result.finalNorm = makeOnesParamV2(nEmbdV2)
+
+  result.layers = newSeq[GpuLayerV2](nLayerV2)
+  for i in 0 ..< nLayerV2:
+    echo "  uploading layer ", i, "..."
+    result.layers[i] = GpuLayerV2(
+      attnWq: makeParamV2(nEmbdV2 * nEmbdV2),
+      attnWk: makeParamV2(nKvDim * nEmbdV2),
+      attnWv: makeParamV2(nKvDim * nEmbdV2),
+      attnWo: makeParamV2(nEmbdV2 * nEmbdV2, residualStd),
+      mlpWgate: makeParamV2(ffnDimV2 * nEmbdV2),
+      mlpWup: makeParamV2(ffnDimV2 * nEmbdV2),
+      mlpWdown: makeParamV2(nEmbdV2 * ffnDimV2, residualStd),
+      ln1: makeOnesParamV2(nEmbdV2),
+      ln2: makeOnesParamV2(nEmbdV2),
+    )
+
+  echo "  uploading RoPE tables..."
+  var cosData = newSeq[float32](blockSizeV2 * halfDimV2)
+  var sinData = newSeq[float32](blockSizeV2 * halfDimV2)
+  for pos in 0 ..< blockSizeV2:
+    for i in 0 ..< halfDimV2:
+      let freq = 1.0f / pow(10000.0f, float32(2 * i) / float32(headDimV2))
+      cosData[pos * halfDimV2 + i] = cos(float32(pos) * freq)
+      sinData[pos * halfDimV2 + i] = sin(float32(pos) * freq)
+  result.ropeCos = toGpu(cosData)
+  result.ropeSin = toGpu(sinData)
+
+proc collectParamsV2*(m: var GpuModelV2): seq[ptr GpuParamV2] =
+  result.add(addr m.wte)
+  result.add(addr m.embedNorm)
+  for i in 0 ..< m.layers.len:
+    result.add(addr m.layers[i].attnWq)
+    result.add(addr m.layers[i].attnWk)
+    result.add(addr m.layers[i].attnWv)
+    result.add(addr m.layers[i].attnWo)
+    result.add(addr m.layers[i].mlpWgate)
+    result.add(addr m.layers[i].mlpWup)
+    result.add(addr m.layers[i].mlpWdown)
+    result.add(addr m.layers[i].ln1)
+    result.add(addr m.layers[i].ln2)
+  result.add(addr m.finalNorm)
+
+proc writeParamV2(s: FileStream, p: GpuParamV2) =
+  let data = gpuDownload(p.data)
+  s.write(int32(data.len))
+  for v in data: s.write(v)
+
+proc readParamV2(s: FileStream, p: var GpuParamV2) =
+  let n = s.readInt32().int
+  var data = newSeq[float32](n)
+  for i in 0 ..< n: data[i] = s.readFloat32()
+  gpuUpload(p.data, data)
+
+proc saveCheckpointV2*(m: GpuModelV2, filename: string) =
+  echo &"saving checkpoint to {filename}..."
+  let s = newFileStream(filename, fmWrite)
+  defer: s.close()
+  s.write(int32(m.vocabSize))
+  s.write(int32(paramCountV2(m)))
+  s.writeParamV2(m.wte)
+  s.writeParamV2(m.embedNorm)
+  for i in 0 ..< m.layers.len:
+    s.writeParamV2(m.layers[i].attnWq)
+    s.writeParamV2(m.layers[i].attnWk)
+    s.writeParamV2(m.layers[i].attnWv)
+    s.writeParamV2(m.layers[i].attnWo)
+    s.writeParamV2(m.layers[i].mlpWgate)
+    s.writeParamV2(m.layers[i].mlpWup)
+    s.writeParamV2(m.layers[i].mlpWdown)
+    s.writeParamV2(m.layers[i].ln1)
+    s.writeParamV2(m.layers[i].ln2)
+  s.writeParamV2(m.finalNorm)
+  echo "  done"
+
+proc loadCheckpointV2*(m: var GpuModelV2, filename: string) =
+  echo &"loading checkpoint from {filename}..."
+  let s = newFileStream(filename, fmRead)
+  defer: s.close()
+  let vocabSize = s.readInt32().int
+  let nParams = s.readInt32().int
+  echo &"  vocab={vocabSize} params={nParams}"
+  s.readParamV2(m.wte)
+  s.readParamV2(m.embedNorm)
+  for i in 0 ..< m.layers.len:
+    s.readParamV2(m.layers[i].attnWq)
+    s.readParamV2(m.layers[i].attnWk)
+    s.readParamV2(m.layers[i].attnWv)
+    s.readParamV2(m.layers[i].attnWo)
+    s.readParamV2(m.layers[i].mlpWgate)
+    s.readParamV2(m.layers[i].mlpWup)
+    s.readParamV2(m.layers[i].mlpWdown)
+    s.readParamV2(m.layers[i].ln1)
+    s.readParamV2(m.layers[i].ln2)
+  s.readParamV2(m.finalNorm)
+  echo "  done"

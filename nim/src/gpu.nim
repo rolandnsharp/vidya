@@ -220,6 +220,10 @@ proc gpu_swiglu_fwd*(gate, up, output: pointer, n: cint)
   {.importc, cdecl.}
 proc gpu_swiglu_bwd*(gate, up, dout, dgate, dup: pointer, n: cint)
   {.importc, cdecl.}
+proc gpu_dropout_fwd*(x, y, mask: pointer, rate: cfloat, n: cint)
+  {.importc, cdecl.}
+proc gpu_dropout_bwd*(dy, mask, dx: pointer, n: cint)
+  {.importc, cdecl.}
 proc gpu_extract_kv_head*(src, dst: pointer,
                           qHead, kvRepeat, seqLen, nKvDim, headDim: cint)
   {.importc, cdecl.}

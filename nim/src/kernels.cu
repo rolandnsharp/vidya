@@ -4,6 +4,7 @@
  * Called directly from Nim via {.importc.} pragmas. */
 
 #include <cuda_runtime.h>
+#include <curand.h>
 #include <math.h>
 #include <float.h>
 
@@ -39,6 +40,50 @@ void gpu_gelu_fwd(const float *x, float *y, int n) {
 
 void gpu_gelu_bwd(const float *x, const float *dy, float *dx, int n) {
     k_gelu_bwd<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(x, dy, dx, n);
+}
+
+/* ── Dropout ──────────────────────────────────────────────────────
+ *
+ * Generate uniform randoms, threshold to binary mask, scale survivors.
+ * Requires cuRAND — init generator at startup. */
+
+static curandGenerator_t g_curand = NULL;
+
+__attribute__((constructor))
+static void init_curand(void) {
+    curandCreateGenerator(&g_curand, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(g_curand, 42ULL);
+}
+
+__global__ void k_dropout_fwd(const float *x, float *y, float *mask,
+                               float rate, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (mask[i] >= rate) {
+        y[i] = x[i] * scale;
+        mask[i] = scale;
+    } else {
+        y[i] = 0.0f;
+        mask[i] = 0.0f;
+    }
+}
+
+__global__ void k_dropout_bwd(const float *dy, const float *mask,
+                               float *dx, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dx[i] += dy[i] * mask[i];
+}
+
+void gpu_dropout_fwd(const float *x, float *y, float *mask,
+                     float rate, int n) {
+    float scale = 1.0f / (1.0f - rate);
+    curandGenerateUniform(g_curand, mask, n);
+    k_dropout_fwd<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(x, y, mask, rate, scale, n);
+}
+
+void gpu_dropout_bwd(const float *dy, const float *mask, float *dx, int n) {
+    k_dropout_bwd<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(dy, mask, dx, n);
 }
 
 /* ── SwiGLU ──────────────────────────────────────────────────────
