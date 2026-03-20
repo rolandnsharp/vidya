@@ -4,7 +4,8 @@
 ## No bridge files, no custom blocks, no bytecode wrappers.
 ## This is why we chose Nim.
 
-{.passL: "-lcudart -lcublas -lcurand".}
+{.passL: "src/kernels.o -lcudart -lcublas -lcurand -lstdc++".}
+import std/math
 
 # ── CUDA types ────────────────────────────────────────────────────
 
@@ -166,8 +167,7 @@ proc toGpu*(data: openArray[float32]): GpuBuf =
   gpuUpload(result, data)
 
 # ── CUDA kernel bindings (from kernels.cu) ────────────────────────
-# Link the compiled kernels.o
-{.passL: "src/kernels.o".}
+# kernels.o is linked via the passL at the top of this file
 
 proc gpu_gelu_fwd*(x, y: pointer, n: cint)
   {.importc, cdecl.}
@@ -275,3 +275,13 @@ proc adamStep*(param, grad, m, v: GpuBuf,
 
 proc elasticPull*(param, anchor: GpuBuf, alpha: float32) =
   gpu_elastic(param.data, anchor.data, alpha, cint(param.numel))
+
+# ── NLL (scalar return) ───────────────────────────────────────────
+
+proc gpu_nll_fwd*(probs: pointer, target: cint): cfloat =
+  ## Download probs[target], return -log(p). Tiny transfer.
+  var p: cfloat
+  discard cudaMemcpy(addr p,
+    cast[pointer](cast[int](probs) + target.int * sizeof(cfloat)),
+    csize_t(sizeof(cfloat)), CudaMemcpyDeviceToHost)
+  result = -ln(max(p, 1e-10f))

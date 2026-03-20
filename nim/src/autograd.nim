@@ -1,0 +1,217 @@
+## autograd.nim — Reverse-mode automatic differentiation on GPU
+##
+## Each operation creates a Node with a backward closure.
+## backward() walks the graph in reverse topological order.
+## All data on GPU. Graph structure on CPU.
+
+import gpu, gpu_model
+import std/[tables, math]
+
+type
+  BackwardFn* = proc() {.closure.}
+
+  Node* = ref object
+    id*: int
+    data*: GpuBuf
+    grad*: GpuBuf
+    numel*: int
+    children*: seq[Node]
+    backwardFn*: BackwardFn
+
+var nextId = 0
+proc freshId(): int =
+  result = nextId; inc nextId
+
+proc newNode*(data: GpuBuf, numel: int, children: seq[Node] = @[],
+              bwd: BackwardFn = nil): Node =
+  Node(id: freshId(), data: data, grad: gpuCreate(numel),
+       numel: numel, children: children, backwardFn: bwd)
+
+proc paramNode*(p: GpuParam): Node =
+  ## Leaf node wrapping a model parameter. Shares data/grad buffers.
+  Node(id: freshId(), data: p.data, grad: p.grad,
+       numel: p.numel, children: @[], backwardFn: nil)
+
+# ── Operations ────────────────────────────────────────────────────
+# Pattern: create node, capture its grad by let binding, set backwardFn.
+
+proc agMatmul*(w, x: Node, s, m, n: int): Node =
+  ## y[s,m] = x[s,n] @ w[m,n]^T
+  let yBuf = gpuCreate(s * m)
+  gpuSgemm(2, s, m, n, x.data, w.data, yBuf)
+  result = newNode(yBuf, s * m, @[w, x])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    gpuSgemm(5, m, n, s, yGrad, x.data, w.grad)
+    gpuSgemm(1, s, n, m, yGrad, w.data, x.grad)
+
+proc agAdd*(a, b: Node): Node =
+  let n = a.numel
+  let yBuf = gpuCreate(n)
+  gpu_add(a.data.data, b.data.data, yBuf.data, cint(n))
+  result = newNode(yBuf, n, @[a, b])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    gpu_add_inplace(a.grad.data, yGrad.data, cint(n))
+    gpu_add_inplace(b.grad.data, yGrad.data, cint(n))
+
+proc agGelu*(x: Node): Node =
+  let n = x.numel
+  let yBuf = gpuCreate(n)
+  geluFwd(x.data, yBuf)
+  result = newNode(yBuf, n, @[x])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    geluBwd(x.data, yGrad, x.grad)
+
+proc agRmsNormAffine*(x, gamma: Node, rows, dim: int): Node =
+  let n = rows * dim
+  let yBuf = gpuCreate(n)
+  let rmsBuf = gpuCreate(rows)
+  rmsnormAffineFwd(x.data, gamma.data, yBuf, rmsBuf, rows, dim)
+  result = newNode(yBuf, n, @[x, gamma])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    rmsnormAffineBwd(x.data, gamma.data, yGrad, rmsBuf,
+                     x.grad, gamma.grad, rows, dim)
+
+proc agSoftmax*(x: Node, rows, cols: int): Node =
+  let n = rows * cols
+  let yBuf = gpuCreate(n)
+  softmaxFwd(x.data, yBuf, rows, cols)
+  result = newNode(yBuf, n, @[x])
+  let yData = result.data
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    softmaxBwd(yData, yGrad, x.grad, rows, cols)
+
+proc agEmbed*(wte: Node, tokenIds: seq[int32], seqLen, dim: int): Node =
+  let n = seqLen * dim
+  let yBuf = gpuCreate(n)
+  var tokBuf: pointer
+  discard cudaMalloc(addr tokBuf, csize_t(seqLen * sizeof(int32)))
+  discard cudaMemcpy(tokBuf, unsafeAddr tokenIds[0],
+                     csize_t(seqLen * sizeof(int32)), CudaMemcpyHostToDevice)
+  gpu_embed_fwd(wte.data.data, tokBuf, yBuf.data, cint(seqLen), cint(dim))
+  result = newNode(yBuf, n, @[wte])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    gpu_embed_bwd(wte.grad.data, tokBuf, yGrad.data, cint(seqLen), cint(dim))
+    # Note: tokBuf leaks — need to free after backward. TODO: cleanup list.
+
+proc agRow*(mat: Node, rowIdx, cols: int): Node =
+  let yBuf = gpuCreate(cols)
+  discard cudaMemcpy(yBuf.data,
+    cast[pointer](cast[int](mat.data.data) + rowIdx * cols * sizeof(cfloat)),
+    csize_t(cols * sizeof(cfloat)), CudaMemcpyDeviceToDevice)
+  result = newNode(yBuf, cols, @[mat])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    # Accumulate row gradient back
+    gpu_add_inplace(
+      cast[pointer](cast[int](mat.grad.data) + rowIdx * cols * sizeof(cfloat)),
+      yGrad.data, cint(cols))
+
+proc agNll*(probs: Node, target: int, vocabSize: int): Node =
+  let lossVal = gpu_nll_fwd(probs.data.data, cint(target))
+  let yBuf = gpuCreate(1)
+  gpuUpload(yBuf, @[lossVal])
+  result = newNode(yBuf, 1, @[probs])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    let dy = gpuDownload(yGrad)
+    let probsCpu = gpuDownload(probs.data)
+    let gradVal = -dy[0] / max(probsCpu[target], 1e-10f)
+    var probGradCpu = gpuDownload(probs.grad)
+    probGradCpu[target] += gradVal
+    gpuUpload(probs.grad, probGradCpu)
+
+# ── Attention ─────────────────────────────────────────────────────
+
+proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
+                  seqLen: int): Node =
+  let n = nEmbd
+  let hd = headDim
+  let scale = 1.0f / sqrt(float32(hd))
+
+  let qRot = gpuCreate(seqLen * n)
+  gpuCopy(q.data, qRot, seqLen * n)
+  let kRot = gpuCreate(seqLen * n)
+  gpuCopy(k.data, kRot, seqLen * n)
+  ropeFwd(qRot, ropeCos, ropeSin, seqLen, n, nHead, hd)
+  ropeFwd(kRot, ropeCos, ropeSin, seqLen, n, nHead, hd)
+
+  let outBuf = gpuCreate(seqLen * n)
+  let qH = gpuCreate(seqLen * hd)
+  let kH = gpuCreate(seqLen * hd)
+  let vH = gpuCreate(seqLen * hd)
+  let scores = gpuCreate(seqLen * seqLen)
+  let weights = gpuCreate(seqLen * seqLen)
+  let attnH = gpuCreate(seqLen * hd)
+
+  var allWeights = newSeq[GpuBuf](nHead)
+  for h in 0 ..< nHead:
+    extractHead(qRot, qH, h, seqLen, n, hd)
+    extractHead(kRot, kH, h, seqLen, n, hd)
+    extractHead(v.data, vH, h, seqLen, n, hd)
+    gpuSgemm(2, seqLen, seqLen, hd, qH, kH, scores)
+    causalMask(scores, scale, seqLen)
+    softmaxFwd(scores, weights, seqLen, seqLen)
+    allWeights[h] = gpuCreate(seqLen * seqLen)
+    gpuCopy(weights, allWeights[h], seqLen * seqLen)
+    gpuSgemm(0, seqLen, hd, seqLen, weights, vH, attnH)
+    insertHead(attnH, outBuf, h, seqLen, n, hd)
+
+  result = newNode(outBuf, seqLen * n, @[q, k, v])
+  let outGrad = result.grad
+  result.backwardFn = proc() =
+    let dqRot = gpuCreate(seqLen * n)
+    let dkRot = gpuCreate(seqLen * n)
+    let doutH = gpuCreate(seqLen * hd)
+    let dvH = gpuCreate(seqLen * hd)
+    let dw = gpuCreate(seqLen * seqLen)
+    let dqH = gpuCreate(seqLen * hd)
+    let dkH = gpuCreate(seqLen * hd)
+
+    for h in 0 ..< nHead:
+      extractHead(outGrad, doutH, h, seqLen, n, hd)
+      extractHead(v.data, vH, h, seqLen, n, hd)
+      gpuSgemm(2, seqLen, seqLen, hd, doutH, vH, dw)
+      gpuSgemm(4, seqLen, hd, seqLen, allWeights[h], doutH, dvH)
+      insertHeadAcc(dvH, v.grad, h, seqLen, n, hd)
+      softmaxBwd(allWeights[h], dw, dw, seqLen, seqLen)
+      gpu_scale(dw.data, scale, dw.data, cint(seqLen * seqLen))
+      extractHead(kRot, kH, h, seqLen, n, hd)
+      gpuSgemm(0, seqLen, hd, seqLen, dw, kH, dqH)
+      insertHeadAcc(dqH, dqRot, h, seqLen, n, hd)
+      extractHead(qRot, qH, h, seqLen, n, hd)
+      gpuSgemm(4, seqLen, hd, seqLen, dw, qH, dkH)
+      insertHeadAcc(dkH, dkRot, h, seqLen, n, hd)
+
+    ropeBwd(dqRot, ropeCos, ropeSin, seqLen, n, nHead, hd)
+    ropeBwd(dkRot, ropeCos, ropeSin, seqLen, n, nHead, hd)
+    gpu_add_inplace(q.grad.data, dqRot.data, cint(seqLen * n))
+    gpu_add_inplace(k.grad.data, dkRot.data, cint(seqLen * n))
+
+# ── Backward ──────────────────────────────────────────────────────
+
+proc backward*(loss: Node) =
+  var visited = initTable[int, bool]()
+  var topo: seq[Node]
+  proc buildTopo(node: Node) =
+    if node.id in visited: return
+    visited[node.id] = true
+    for child in node.children: buildTopo(child)
+    topo.add(node)
+  buildTopo(loss)
+
+  # Seed
+  gpuUpload(loss.grad, @[1.0f])
+
+  # Reverse order
+  for i in countdown(topo.high, 0):
+    if topo[i].backwardFn != nil:
+      topo[i].backwardFn()
+
+proc zeroGrad*(params: seq[ptr GpuParam]) =
+  for p in params: gpuZero(p[].grad)
