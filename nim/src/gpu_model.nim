@@ -4,7 +4,7 @@
 ## Initialised with random weights on CPU, then uploaded.
 
 import gpu
-import std/[math, random]
+import std/[math, random, streams, os, strformat]
 
 const
   nLayer*   = 8
@@ -115,6 +115,65 @@ proc paramCount*(m: GpuModel): int =
     result += layer.attnWv.numel + layer.attnWo.numel
     result += layer.mlpFc1.numel + layer.mlpFc2.numel
     result += layer.ln1.numel + layer.ln2.numel
+
+# ── Checkpoint save/load ──────────────────────────────────────────
+
+proc saveCheckpoint*(m: GpuModel, filename: string) =
+  ## Download all weights from GPU and save as flat float32 binary.
+  echo &"saving checkpoint to {filename}..."
+  let s = newFileStream(filename, fmWrite)
+  defer: s.close()
+  # Header: vocab_size, param_count
+  s.write(int32(m.vocabSize))
+  s.write(int32(paramCount(m)))
+
+  proc saveParam(p: GpuParam, s: FileStream) =
+    let data = gpuDownload(p.data)
+    s.write(int32(data.len))
+    for v in data: s.write(v)
+
+  saveParam(m.wte, s)
+  saveParam(m.embedNorm, s)
+  for i in 0 ..< m.layers.len:
+    saveParam(m.layers[i].attnWq, s)
+    saveParam(m.layers[i].attnWk, s)
+    saveParam(m.layers[i].attnWv, s)
+    saveParam(m.layers[i].attnWo, s)
+    saveParam(m.layers[i].mlpFc1, s)
+    saveParam(m.layers[i].mlpFc2, s)
+    saveParam(m.layers[i].ln1, s)
+    saveParam(m.layers[i].ln2, s)
+  saveParam(m.finalNorm, s)
+  echo "  done"
+
+proc loadCheckpoint*(m: var GpuModel, filename: string) =
+  ## Load weights from flat float32 binary file into GPU.
+  echo &"loading checkpoint from {filename}..."
+  let s = newFileStream(filename, fmRead)
+  defer: s.close()
+  let vocabSize = s.readInt32().int
+  let nParams = s.readInt32().int
+  echo &"  vocab={vocabSize} params={nParams}"
+
+  proc loadParam(p: var GpuParam, s: FileStream) =
+    let n = s.readInt32().int
+    var data = newSeq[float32](n)
+    for i in 0 ..< n: data[i] = s.readFloat32()
+    gpuUpload(p.data, data)
+
+  loadParam(m.wte, s)
+  loadParam(m.embedNorm, s)
+  for i in 0 ..< m.layers.len:
+    loadParam(m.layers[i].attnWq, s)
+    loadParam(m.layers[i].attnWk, s)
+    loadParam(m.layers[i].attnWv, s)
+    loadParam(m.layers[i].attnWo, s)
+    loadParam(m.layers[i].mlpFc1, s)
+    loadParam(m.layers[i].mlpFc2, s)
+    loadParam(m.layers[i].ln1, s)
+    loadParam(m.layers[i].ln2, s)
+  loadParam(m.finalNorm, s)
+  echo "  done"
 
 proc collectParams*(m: var GpuModel): seq[ptr GpuParam] =
   ## Gather pointers to all trainable parameters for the optimizer.

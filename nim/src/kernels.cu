@@ -371,22 +371,35 @@ void gpu_embed_bwd(float *wte_grad, const int *tokens, const float *dout,
 
 /* ── Adam ────────────────────────────────────────────────────────── */
 
-__global__ void k_adam(float *param, float *grad, float *m, float *v,
-                       float lr, float b1, float b2,
-                       float bc1, float bc2, int n) {
+/* AdamW: Adam with decoupled weight decay.
+ * Weight decay is applied directly to params, not through gradient.
+ * This prevents weights from growing unbounded — critical for stability. */
+__global__ void k_adamw(float *param, float *grad, float *m, float *v,
+                        float lr, float b1, float b2,
+                        float bc1, float bc2, float wd, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g = grad[i];
     m[i] = b1 * m[i] + (1.0f - b1) * g;
     v[i] = b2 * v[i] + (1.0f - b2) * g * g;
+    /* Decoupled weight decay: applied to param directly */
+    param[i] *= (1.0f - lr * wd);
+    /* Adam update */
     param[i] -= lr * (m[i] * bc1) / (sqrtf(v[i] * bc2) + 1e-8f);
     grad[i] = 0.0f;
 }
 
+void gpu_adamw(float *param, float *grad, float *m, float *v,
+               float lr, float b1, float b2, float bc1, float bc2,
+               float wd, int n) {
+    k_adamw<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(
+        param, grad, m, v, lr, b1, b2, bc1, bc2, wd, n);
+}
+
+/* Keep old adam for backward compat */
 void gpu_adam(float *param, float *grad, float *m, float *v,
              float lr, float b1, float b2, float bc1, float bc2, int n) {
-    k_adam<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(
-        param, grad, m, v, lr, b1, b2, bc1, bc2, n);
+    gpu_adamw(param, grad, m, v, lr, b1, b2, bc1, bc2, 0.0f, n);
 }
 
 /* ── Elastic pull ────────────────────────────────────────────────── */
@@ -449,6 +462,22 @@ void gpu_clip_grads(float **grads, const int *sizes, int n_tensors,
                 grads[t], scale, grads[t], n);
         }
     }
+}
+
+/* ── Zero upper triangle ─────────────────────────────────────────── */
+
+__global__ void k_zero_upper(float *data, int seq_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * seq_len;
+    if (idx >= total) return;
+    int row = idx / seq_len;
+    int col = idx % seq_len;
+    if (col > row) data[idx] = 0.0f;
+}
+
+void gpu_zero_upper(float *data, int seq_len) {
+    int n = seq_len * seq_len;
+    k_zero_upper<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(data, seq_len);
 }
 
 } /* extern "C" */

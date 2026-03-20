@@ -7,10 +7,13 @@ import gpu, gpu_model, autograd, ag_forward, bpe
 import std/[math, times, strformat, os]
 
 const
-  learningRate = 0.00002f  # very conservative — batch size 1 is noisy
+  learningRate = 0.0001f   # stable up to 0.00015, conservative peak
+  minLr = 0.00001f         # 10% of peak
   beta1 = 0.9f
-  beta2 = 0.999f
-  warmupSteps = 200
+  beta2 = 0.95f
+  weightDecay = 0.1f       # critical for stability
+  warmupSteps = 2000
+  gradAccumSteps = 8       # effective batch size = 8
   logInterval = 50
   checkpointInterval = 2500
   maxGradNorm = 1.0f
@@ -24,11 +27,13 @@ proc formatDuration(secs: float): string =
   else: &"{s}s"
 
 proc getLr(step, numSteps: int): float32 =
+  ## Cosine decay with warmup and minimum LR floor.
   if step < warmupSteps:
     learningRate * float32(step) / float32(warmupSteps)
   else:
     let progress = float32(step - warmupSteps) / float32(numSteps - warmupSteps)
-    learningRate * 0.5f * (1.0f + cos(PI.float32 * progress))
+    let cosDecay = 0.5f * (1.0f + cos(PI.float32 * progress))
+    minLr + (learningRate - minLr) * cosDecay
 
 when isMainModule:
   let baseDir = getAppDir().parentDir()
@@ -53,6 +58,11 @@ when isMainModule:
   echo "init model on GPU..."
   var m = initGpuModel(tok.vocab.len)
   echo &"params: {paramCount(m)}"
+
+  # Load checkpoint if one exists
+  let latestCp = vidyaRoot / "nimllm_latest.bin"
+  if fileExists(latestCp):
+    loadCheckpoint(m, latestCp)
 
   # Collect param pointers for optimizer
   var params = collectParams(m)
@@ -79,20 +89,25 @@ when isMainModule:
 
   # Training
   let numSteps = 200000
-  echo &"training {numSteps} steps..."
+  echo &"training {numSteps} steps (grad_accum={gradAccumSteps}, effective_batch={gradAccumSteps})..."
   trackingEnabled = true
   let tStart = cpuTime()
   var lossSum = 0.0f
   var stepCount = 0
+  var microStep = 0  # counts within gradient accumulation
+
+  # Pre-build grad pointer arrays for clipping
+  var gradPtrs = newSeq[pointer](params.len)
+  var gradSizes = newSeq[cint](params.len)
+  for i in 0 ..< params.len:
+    gradPtrs[i] = params[i][].grad.data
+    gradSizes[i] = cint(params[i][].numel)
 
   for step in 0 ..< numSteps:
     let tokens = tokenizedDocs[step mod tokenizedDocs.len]
     if tokens.len < 3: continue
 
-    # Zero gradients
-    zeroGrad(params)
-
-    # Forward + loss (builds autograd graph, all allocs tracked)
+    # Forward + loss (builds autograd graph)
     let (lossNode, lossVal) = agComputeLoss(m, tokens)
     if lossNode == nil:
       freeStepAllocations()
@@ -101,35 +116,49 @@ when isMainModule:
       freeStepAllocations()
       continue
 
-    # Backward (propagates gradients, may allocate more tracked buffers)
+    # Backward — gradients accumulate across micro-steps
     backward(lossNode)
-
-    # Gradient clipping — proper L2 norm on GPU, clip to maxGradNorm
-    var gradPtrs = newSeq[pointer](params.len)
-    var gradSizes = newSeq[cint](params.len)
-    for i in 0 ..< params.len:
-      gradPtrs[i] = params[i][].grad.data
-      gradSizes[i] = cint(params[i][].numel)
-    clipGradNorm(gradPtrs, gradSizes, maxGradNorm)
-
-    # Adam update
-    let lr = getLr(step, numSteps)
-    let bc1 = 1.0f / (1.0f - pow(beta1, float32(step + 1)))
-    let bc2 = 1.0f / (1.0f - pow(beta2, float32(step + 1)))
-    for i in 0 ..< params.len:
-      adamStep(params[i][].data, params[i][].grad, adamM[i], adamV[i],
-               lr, beta1, beta2, bc1, bc2)
-
-    # Free ALL intermediate GPU buffers from this step
     freeStepAllocations()
 
     lossSum += lossVal
-    stepCount += 1
+    microStep += 1
 
-    if stepCount mod logInterval == 0:
+    # Only update weights every gradAccumSteps micro-steps
+    if microStep >= gradAccumSteps:
+      # Scale gradients by 1/gradAccumSteps to average
+      for i in 0 ..< params.len:
+        gpu_scale(params[i][].grad.data, 1.0f / float32(gradAccumSteps),
+                  params[i][].grad.data, cint(params[i][].numel))
+
+      # Gradient clipping
+      clipGradNorm(gradPtrs, gradSizes, maxGradNorm)
+
+      # AdamW update with weight decay
+      let lr = getLr(stepCount, numSteps div gradAccumSteps)
+      let bc1 = 1.0f / (1.0f - pow(beta1, float32(stepCount + 1)))
+      let bc2 = 1.0f / (1.0f - pow(beta2, float32(stepCount + 1)))
+      for i in 0 ..< params.len:
+        adamwStep(params[i][].data, params[i][].grad, adamM[i], adamV[i],
+                  lr, beta1, beta2, bc1, bc2, weightDecay)
+
+      # Zero gradients for next accumulation cycle
+      zeroGrad(params)
+      microStep = 0
+      stepCount += 1
+
+    # Save checkpoint every checkpointInterval optimizer steps
+    if stepCount > 0 and stepCount mod checkpointInterval == 0 and microStep == 0:
+      let cpFile = vidyaRoot / &"nimllm_{stepCount}.bin"
+      saveCheckpoint(m, cpFile)
+      # Also save as latest for easy resume
+      saveCheckpoint(m, vidyaRoot / "nimllm_latest.bin")
+
+    if stepCount > 0 and stepCount mod logInterval == 0 and microStep == 0:
       let elapsed = cpuTime() - tStart
       let stepsPerSec = float(stepCount) / elapsed
-      let stepsLeft = float(numSteps - step - 1)
+      let totalOptSteps = numSteps div gradAccumSteps
+      let stepsLeft = float(totalOptSteps - stepCount)
       let eta = stepsLeft / max(stepsPerSec, 0.01)
-      echo &"step {step + 1:>6} / {numSteps} | loss {lossSum / float32(logInterval):.4f} | lr {lr:.6f} | {stepsPerSec:.1f} steps/s | {formatDuration(elapsed)} elapsed | {formatDuration(eta)} remaining"
+      let lr = getLr(stepCount, totalOptSteps)
+      echo &"step {stepCount:>6} / {totalOptSteps} | loss {lossSum / float32(logInterval * gradAccumSteps):.4f} | lr {lr:.6f} | {stepsPerSec:.1f} opt/s | {formatDuration(elapsed)} elapsed | {formatDuration(eta)} remaining"
       lossSum = 0.0f

@@ -189,23 +189,32 @@ proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
     let dkRot = trackedCreate(seqLen * n)
     let doutH = trackedCreate(seqLen * hd)
     let dvH = trackedCreate(seqLen * hd)
-    let dw = trackedCreate(seqLen * seqLen)
+    let dw = trackedCreate(seqLen * seqLen)      # dWeights (input to softmax bwd)
+    let dScores = trackedCreate(seqLen * seqLen)  # output of softmax bwd
     let dqH = trackedCreate(seqLen * hd)
     let dkH = trackedCreate(seqLen * hd)
 
     for h in 0 ..< nHead:
       extractHead(outGrad, doutH, h, seqLen, n, hd)
       extractHead(v.data, vH, h, seqLen, n, hd)
+      # dWeights = dAttn @ V^T
       gpuSgemm(2, seqLen, seqLen, hd, doutH, vH, dw)
+      # dV += Weights^T @ dAttn
       gpuSgemm(4, seqLen, hd, seqLen, allWeights[h], doutH, dvH)
       insertHeadAcc(dvH, v.grad, h, seqLen, n, hd)
-      softmaxBwd(allWeights[h], dw, dw, seqLen, seqLen)
-      gpu_scale(dw.data, scale, dw.data, cint(seqLen * seqLen))
+      # Softmax backward into separate buffer (no aliasing)
+      softmaxBwd(allWeights[h], dw, dScores, seqLen, seqLen)
+      # Apply scale (was applied in forward before softmax)
+      gpu_scale(dScores.data, scale, dScores.data, cint(seqLen * seqLen))
+      # Zero upper triangle of gradient (causal mask)
+      gpu_zero_upper(dScores.data, cint(seqLen))
+      # dQ_rot += dScores @ K_rot
       extractHead(kRot, kH, h, seqLen, n, hd)
-      gpuSgemm(0, seqLen, hd, seqLen, dw, kH, dqH)
+      gpuSgemm(0, seqLen, hd, seqLen, dScores, kH, dqH)
       insertHeadAcc(dqH, dqRot, h, seqLen, n, hd)
+      # dK_rot += dScores^T @ Q_rot
       extractHead(qRot, qH, h, seqLen, n, hd)
-      gpuSgemm(4, seqLen, hd, seqLen, dw, qH, dkH)
+      gpuSgemm(4, seqLen, hd, seqLen, dScores, qH, dkH)
       insertHeadAcc(dkH, dkRot, h, seqLen, n, hd)
 
     ropeBwd(dqRot, ropeCos, ropeSin, seqLen, n, nHead, hd)

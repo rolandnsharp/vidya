@@ -211,7 +211,12 @@ proc gpu_embed_bwd*(wte_grad: pointer, tokens: pointer, dout: pointer,
 proc gpu_adam*(param, grad, m, v: pointer,
               lr, b1, b2, bc1, bc2: cfloat, n: cint)
   {.importc, cdecl.}
+proc gpu_adamw*(param, grad, m, v: pointer,
+               lr, b1, b2, bc1, bc2, wd: cfloat, n: cint)
+  {.importc, cdecl.}
 proc gpu_elastic*(param, anchor: pointer, alpha: cfloat, n: cint)
+  {.importc, cdecl.}
+proc gpu_zero_upper*(data: pointer, seq_len: cint)
   {.importc, cdecl.}
 
 # ── High-level wrappers using GpuBuf ─────────────────────────────
@@ -272,6 +277,11 @@ proc adamStep*(param, grad, m, v: GpuBuf,
                lr, b1, b2, bc1, bc2: float32) =
   gpu_adam(param.data, grad.data, m.data, v.data,
            lr, b1, b2, bc1, bc2, cint(param.numel))
+
+proc adamwStep*(param, grad, m, v: GpuBuf,
+                lr, b1, b2, bc1, bc2, wd: float32) =
+  gpu_adamw(param.data, grad.data, m.data, v.data,
+            lr, b1, b2, bc1, bc2, wd, cint(param.numel))
 
 proc elasticPull*(param, anchor: GpuBuf, alpha: float32) =
   gpu_elastic(param.data, anchor.data, alpha, cint(param.numel))
