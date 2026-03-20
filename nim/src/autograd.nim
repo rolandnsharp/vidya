@@ -132,6 +132,30 @@ proc agRow*(mat: Node, rowIdx, cols: int): Node =
       cast[pointer](cast[int](mat.grad.data) + rowIdx * cols * sizeof(cfloat)),
       yGrad.data, cint(cols))
 
+proc agCrossEntropy*(logits: Node, target: int, vocabSize: int): Node =
+  ## Fused softmax + NLL. Backward is (probs - one_hot), bounded [-1, 1].
+  ## This avoids the 1/p gradient explosion from separate softmax + NLL.
+  let yBuf = trackedCreate(vocabSize)
+  softmaxFwd(logits.data, yBuf, 1, vocabSize)
+  let lossVal = gpu_nll_fwd(yBuf.data, cint(target))
+  let lossBuf = trackedCreate(1)
+  gpuUpload(lossBuf, @[lossVal])
+  result = newNode(lossBuf, 1, @[logits])
+  let yGrad = result.grad
+  result.backwardFn = proc() =
+    let dy = gpuDownload(yGrad)
+    let upstream = dy[0]
+    # Gradient of cross-entropy w.r.t. logits = upstream * (probs - one_hot)
+    # probs are already in yBuf from the forward
+    var probsCpu = gpuDownload(yBuf)
+    for i in 0 ..< vocabSize:
+      probsCpu[i] = upstream * probsCpu[i]
+    probsCpu[target] -= upstream
+    # Upload gradient into logits.grad (accumulate)
+    let gradBuf = trackedCreate(vocabSize)
+    gpuUpload(gradBuf, probsCpu)
+    gpu_add_inplace(logits.grad.data, gradBuf.data, cint(vocabSize))
+
 proc agNll*(probs: Node, target: int, vocabSize: int): Node =
   let lossVal = gpu_nll_fwd(probs.data.data, cint(target))
   let yBuf = trackedCreate(1)

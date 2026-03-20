@@ -54,7 +54,7 @@ proc randomNormal(n: int, std: float32): seq[float32] =
     let u2 = rand(1.0).float32
     result[i] = std * sqrt(-2.0f * ln(max(u1, 1e-10f))) * cos(2.0f * PI.float32 * u2)
 
-proc makeParam(n: int, std: float32 = 0.08f): GpuParam =
+proc makeParam(n: int, std: float32 = 0.02f): GpuParam =
   ## Create a trainable parameter with random init on GPU.
   let hostData = randomNormal(n, std)
   result.numel = n
@@ -118,32 +118,36 @@ proc paramCount*(m: GpuModel): int =
 
 # ── Checkpoint save/load ──────────────────────────────────────────
 
+proc writeParam(s: FileStream, p: GpuParam) =
+  let data = gpuDownload(p.data)
+  s.write(int32(data.len))
+  for v in data: s.write(v)
+
+proc readParam(s: FileStream, p: var GpuParam) =
+  let n = s.readInt32().int
+  var data = newSeq[float32](n)
+  for i in 0 ..< n: data[i] = s.readFloat32()
+  gpuUpload(p.data, data)
+
 proc saveCheckpoint*(m: GpuModel, filename: string) =
   ## Download all weights from GPU and save as flat float32 binary.
   echo &"saving checkpoint to {filename}..."
   let s = newFileStream(filename, fmWrite)
   defer: s.close()
-  # Header: vocab_size, param_count
   s.write(int32(m.vocabSize))
   s.write(int32(paramCount(m)))
-
-  proc saveParam(p: GpuParam, s: FileStream) =
-    let data = gpuDownload(p.data)
-    s.write(int32(data.len))
-    for v in data: s.write(v)
-
-  saveParam(m.wte, s)
-  saveParam(m.embedNorm, s)
+  s.writeParam(m.wte)
+  s.writeParam(m.embedNorm)
   for i in 0 ..< m.layers.len:
-    saveParam(m.layers[i].attnWq, s)
-    saveParam(m.layers[i].attnWk, s)
-    saveParam(m.layers[i].attnWv, s)
-    saveParam(m.layers[i].attnWo, s)
-    saveParam(m.layers[i].mlpFc1, s)
-    saveParam(m.layers[i].mlpFc2, s)
-    saveParam(m.layers[i].ln1, s)
-    saveParam(m.layers[i].ln2, s)
-  saveParam(m.finalNorm, s)
+    s.writeParam(m.layers[i].attnWq)
+    s.writeParam(m.layers[i].attnWk)
+    s.writeParam(m.layers[i].attnWv)
+    s.writeParam(m.layers[i].attnWo)
+    s.writeParam(m.layers[i].mlpFc1)
+    s.writeParam(m.layers[i].mlpFc2)
+    s.writeParam(m.layers[i].ln1)
+    s.writeParam(m.layers[i].ln2)
+  s.writeParam(m.finalNorm)
   echo "  done"
 
 proc loadCheckpoint*(m: var GpuModel, filename: string) =
@@ -154,25 +158,18 @@ proc loadCheckpoint*(m: var GpuModel, filename: string) =
   let vocabSize = s.readInt32().int
   let nParams = s.readInt32().int
   echo &"  vocab={vocabSize} params={nParams}"
-
-  proc loadParam(p: var GpuParam, s: FileStream) =
-    let n = s.readInt32().int
-    var data = newSeq[float32](n)
-    for i in 0 ..< n: data[i] = s.readFloat32()
-    gpuUpload(p.data, data)
-
-  loadParam(m.wte, s)
-  loadParam(m.embedNorm, s)
+  s.readParam(m.wte)
+  s.readParam(m.embedNorm)
   for i in 0 ..< m.layers.len:
-    loadParam(m.layers[i].attnWq, s)
-    loadParam(m.layers[i].attnWk, s)
-    loadParam(m.layers[i].attnWv, s)
-    loadParam(m.layers[i].attnWo, s)
-    loadParam(m.layers[i].mlpFc1, s)
-    loadParam(m.layers[i].mlpFc2, s)
-    loadParam(m.layers[i].ln1, s)
-    loadParam(m.layers[i].ln2, s)
-  loadParam(m.finalNorm, s)
+    s.readParam(m.layers[i].attnWq)
+    s.readParam(m.layers[i].attnWk)
+    s.readParam(m.layers[i].attnWv)
+    s.readParam(m.layers[i].attnWo)
+    s.readParam(m.layers[i].mlpFc1)
+    s.readParam(m.layers[i].mlpFc2)
+    s.readParam(m.layers[i].ln1)
+    s.readParam(m.layers[i].ln2)
+  s.readParam(m.finalNorm)
   echo "  done"
 
 proc collectParams*(m: var GpuModel): seq[ptr GpuParam] =

@@ -64,13 +64,13 @@ proc agComputeLoss*(m: var GpuModel, tokens: seq[int32]): (Node, float32) =
 
   let logits = agForward(m, tokens[0 ..< seqLen], seqLen)
 
-  # Per-position softmax + NLL, then mean
+  # Per-position fused cross-entropy (softmax + NLL in one op).
+  # Backward is (probs - one_hot), bounded [-1, 1] — no gradient explosion.
   var losses: seq[Node]
   for i in 0 ..< seqLen:
     let logitsI = agRow(logits, i, m.vocabSize)
-    let probs = agSoftmax(logitsI, 1, m.vocabSize)
-    let nll = agNll(probs, tokens[i + 1].int, m.vocabSize)
-    losses.add(nll)
+    let ce = agCrossEntropy(logitsI, tokens[i + 1].int, m.vocabSize)
+    losses.add(ce)
 
   # Mean loss — sum the scalar NLL values
   # Download each to compute mean, then create a node

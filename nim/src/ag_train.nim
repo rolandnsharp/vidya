@@ -7,14 +7,14 @@ import gpu, gpu_model, autograd, ag_forward, bpe
 import std/[math, times, strformat, os]
 
 const
-  learningRate = 0.0001f   # stable up to 0.00015, conservative peak
-  minLr = 0.00001f         # 10% of peak
+  learningRate = 0.0001f
+  minLr = 0.00001f
   beta1 = 0.9f
   beta2 = 0.95f
-  weightDecay = 0.1f       # critical for stability
+  weightDecay = 0.1f
   warmupSteps = 2000
-  gradAccumSteps = 8       # effective batch size = 8
-  logInterval = 50
+  gradAccumSteps = 1       # batch size 1 — matches OCaml recipe
+  logInterval = 100
   checkpointInterval = 2500
   maxGradNorm = 1.0f
 
@@ -130,8 +130,11 @@ when isMainModule:
         gpu_scale(params[i][].grad.data, 1.0f / float32(gradAccumSteps),
                   params[i][].grad.data, cint(params[i][].numel))
 
-      # Gradient clipping
+      # Gradient clipping — log norm occasionally
+      let preNorm = gpu_grad_norm(addr gradPtrs[0], addr gradSizes[0], cint(params.len))
       clipGradNorm(gradPtrs, gradSizes, maxGradNorm)
+      if stepCount mod 50 == 0:
+        echo &"  grad_norm: {preNorm:.2f} → clipped to {maxGradNorm}"
 
       # AdamW update with weight decay
       let lr = getLr(stepCount, numSteps div gradAccumSteps)
