@@ -369,18 +369,10 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
       gpuSgemm(4, S, headDim, S, weights, doutH, dvH)
       insertHeadAcc(dvH, dv, h, S, n, headDim)
 
-      # Causal softmax backward
-      let dwCpu = gpuDownload(dw)
-      let wtCpu = gpuDownload(weights)
-      var dScoresCpu = newSeq[float32](S * S)
-      for i in 0 ..< S:
-        var dot = 0.0f
-        for j in 0 .. i:
-          dot += dwCpu[i * S + j] * wtCpu[i * S + j]
-        for j in 0 .. i:
-          dScoresCpu[i * S + j] =
-            wtCpu[i * S + j] * (dwCpu[i * S + j] - dot) * scale
-      gpuUpload(dScores, dScoresCpu)
+      # Softmax backward on GPU + scale + causal mask
+      softmaxBwd(weights, dw, dScores, S, S)
+      gpu_scale(dScores.data, scale, dScores.data, cint(S * S))
+      gpu_zero_upper(dScores.data, cint(S))
 
       # dQ_h = dScores @ K_h
       extractHead(lc.k, kH, h, S, n, headDim)
