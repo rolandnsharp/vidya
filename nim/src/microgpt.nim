@@ -348,19 +348,30 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     let kH = trackedCreate(S * headDim)
     let vH = trackedCreate(S * headDim)
 
+    let scores = trackedCreate(S * S)
+    let weights = trackedCreate(S * S)
+
     for h in 0 ..< nHead:
       extractHead(dAttnOut, doutH, h, S, n, headDim)
+      extractHead(lc.q, qH, h, S, n, headDim)
+      extractHead(lc.k, kH, h, S, n, headDim)
       extractHead(lc.v, vH, h, S, n, headDim)
+
+      # Recompute attention weights for backward (flash attn doesn't store them)
+      gpuSgemm(2, S, S, headDim, qH, kH, scores)
+      causalMask(scores, scale, S)
+      gpu_clamp(scores.data, -80.0f, 80.0f, cint(S * S))  # safe — only for backward recompute
+      softmaxFwd(scores, weights, S, S)
 
       # dWeights = dAttnOut_h @ V_h^T
       gpuSgemm(2, S, S, headDim, doutH, vH, dw)
       # dV_h = Weights^T @ dAttnOut_h
-      gpuSgemm(4, S, headDim, S, lc.attnWeights[h], doutH, dvH)
+      gpuSgemm(4, S, headDim, S, weights, doutH, dvH)
       insertHeadAcc(dvH, dv, h, S, n, headDim)
 
-      # Causal softmax backward (CPU, matches OCaml exactly)
+      # Causal softmax backward
       let dwCpu = gpuDownload(dw)
-      let wtCpu = gpuDownload(lc.attnWeights[h])
+      let wtCpu = gpuDownload(weights)
       var dScoresCpu = newSeq[float32](S * S)
       for i in 0 ..< S:
         var dot = 0.0f
