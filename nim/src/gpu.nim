@@ -128,10 +128,18 @@ proc gpuZero*(buf: GpuBuf) =
 
 var gCublas: CublasHandle
 
+proc cublasSetMathMode*(handle: CublasHandle, mode: cint): CublasStatus
+  {.importc: "cublasSetMathMode", header: "<cublas_v2.h>".}
+
+const CUBLAS_PEDANTIC_MATH* = 2.cint  # full float32, no TF32
+
 proc gpuInit*() =
   ## Initialise cuBLAS. Call once at startup.
   let err = cublasCreate(addr gCublas)
   assert err == 0, "cublasCreate failed"
+  # Disable TF32 — use full float32 precision for matmuls.
+  # TF32 uses only 10 mantissa bits, causing NaN at scale.
+  discard cublasSetMathMode(gCublas, CUBLAS_PEDANTIC_MATH)
 
 # ── GEMM wrapper ──────────────────────────────────────────────────
 

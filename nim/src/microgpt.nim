@@ -12,11 +12,11 @@ import std/[math, random, strformat, os, streams, times]
 # ── Configuration ─────────────────────────────────────────────────
 
 const
-  nLayer   = 1      # match Python microGPT exactly
-  nEmbd    = 16
+  nLayer   = 4
+  nEmbd    = 256
   nHead    = 4
-  headDim  = nEmbd div nHead  # 4
-  blockSize = 16
+  headDim  = nEmbd div nHead  # 64
+  blockSize = 256
   ffnMul   = 4
 
 # ── Model ─────────────────────────────────────────────────────────
@@ -26,29 +26,33 @@ type
     wq, wk, wv, wo: GpuBuf       # attention weights [nEmbd, nEmbd]
     fc1: GpuBuf                    # MLP up [ffnMul*nEmbd, nEmbd]
     fc2: GpuBuf                    # MLP down [nEmbd, ffnMul*nEmbd]
+    ln1g, ln2g: GpuBuf            # learnable RMSNorm gamma [nEmbd]
     # Gradients
     dwq, dwk, dwv, dwo: GpuBuf
     dfc1, dfc2: GpuBuf
+    dln1g, dln2g: GpuBuf
 
   Model = object
     wte: GpuBuf                    # token embeddings [vocab, nEmbd]
     wpe: GpuBuf                    # position embeddings [blockSize, nEmbd]
     lmHead: GpuBuf                 # output projection [vocab, nEmbd]
+    lnFg: GpuBuf                   # final RMSNorm gamma [nEmbd]
     layers: seq[Layer]
     vocabSize: int
     # Gradients
     dwte, dwpe, dlmHead: GpuBuf
+    dlnFg: GpuBuf
 
 proc initModel(vocabSize: int): Model =
   randomize(42)
   let std = 0.02f
 
-  proc randBuf(n: int): GpuBuf =
+  proc randBuf(n: int, s: float32 = std): GpuBuf =
     var host = newSeq[float32](n)
     for i in 0 ..< n:
       let u1 = rand(1.0).float32
       let u2 = rand(1.0).float32
-      host[i] = std * sqrt(-2f * ln(max(u1, 1e-10f))) * cos(2f * PI.float32 * u2)
+      host[i] = s * sqrt(-2f * ln(max(u1, 1e-10f))) * cos(2f * PI.float32 * u2)
     toGpu(host)
 
   result.vocabSize = vocabSize
@@ -59,21 +63,33 @@ proc initModel(vocabSize: int): Model =
   result.dwpe = gpuCreate(blockSize * nEmbd)
   result.dlmHead = gpuCreate(vocabSize * nEmbd)
 
+  proc onesBuf(n: int): GpuBuf =
+    var h = newSeq[float32](n)
+    for i in 0 ..< n: h[i] = 1.0f
+    toGpu(h)
+
+  result.lnFg = onesBuf(nEmbd)
+  result.dlnFg = gpuCreate(nEmbd)
+
   for i in 0 ..< nLayer:
     let resStd = std / sqrt(float32(2 * nLayer))
     result.layers.add(Layer(
       wq: randBuf(nEmbd * nEmbd),
       wk: randBuf(nEmbd * nEmbd),
       wv: randBuf(nEmbd * nEmbd),
-      wo: randBuf(nEmbd * nEmbd),  # TODO: use resStd
+      wo: randBuf(nEmbd * nEmbd, resStd),
       fc1: randBuf(ffnMul * nEmbd * nEmbd),
-      fc2: randBuf(nEmbd * ffnMul * nEmbd),
+      fc2: randBuf(nEmbd * ffnMul * nEmbd, resStd),
+      ln1g: onesBuf(nEmbd),
+      ln2g: onesBuf(nEmbd),
       dwq: gpuCreate(nEmbd * nEmbd),
       dwk: gpuCreate(nEmbd * nEmbd),
       dwv: gpuCreate(nEmbd * nEmbd),
       dwo: gpuCreate(nEmbd * nEmbd),
       dfc1: gpuCreate(ffnMul * nEmbd * nEmbd),
       dfc2: gpuCreate(nEmbd * ffnMul * nEmbd),
+      dln1g: gpuCreate(nEmbd),
+      dln2g: gpuCreate(nEmbd),
     ))
 
   let total = vocabSize * nEmbd * 2 + blockSize * nEmbd +
@@ -148,12 +164,12 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     lc.xResidual1 = trackedCreate(S * n)
     gpuCopy(x, lc.xResidual1, S * n)
 
-    # RMSNorm 1 — save original input for backward
+    # RMSNorm 1 with learnable gamma — save original input for backward
     lc.xInput1 = trackedCreate(S * n)
     gpuCopy(x, lc.xInput1, S * n)
     lc.xNorm1 = trackedCreate(S * n)
     lc.rms1 = trackedCreate(S)
-    gpu_rmsnorm_forward(x.data, lc.xNorm1.data, lc.rms1.data, cint(S), cint(n))
+    gpu_rmsnorm_affine_fwd(x.data, layer.ln1g.data, lc.xNorm1.data, lc.rms1.data, cint(S), cint(n))
 
     # Q, K, V projections
     lc.q = trackedCreate(S * n)
@@ -182,8 +198,8 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
 
       gpuSgemm(2, S, S, headDim, qH, kH, scores)
       causalMask(scores, scale, S)
-      # Clamp scores to prevent overflow
-      gpu_clamp(scores.data, -65000.0f, 65000.0f, cint(S * S))
+      # Clamp AFTER scaling — prevent any possibility of overflow
+      gpu_clamp(scores.data, -10.0f, 10.0f, cint(S * S))
       softmaxFwd(scores, weights, S, S)
 
       lc.attnWeights[h] = trackedCreate(S * S)
@@ -201,12 +217,12 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     gpu_add(lc.xResidual1.data, projected.data, lc.xResidual2.data, cint(S * n))
     x = lc.xResidual2
 
-    # RMSNorm 2 — save original input for backward
+    # RMSNorm 2 with learnable gamma — save original input for backward
     lc.xInput2 = trackedCreate(S * n)
     gpuCopy(x, lc.xInput2, S * n)
     lc.xNorm2 = trackedCreate(S * n)
     lc.rms2 = trackedCreate(S)
-    gpu_rmsnorm_forward(x.data, lc.xNorm2.data, lc.rms2.data, cint(S), cint(n))
+    gpu_rmsnorm_affine_fwd(x.data, layer.ln2g.data, lc.xNorm2.data, lc.rms2.data, cint(S), cint(n))
 
     # MLP: fc1 -> relu -> fc2
     lc.fc1Out = trackedCreate(S * ffnMul * n)
@@ -226,12 +242,12 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
 
     cache.layerCaches.add(lc)
 
-  # Final norm — save original input for backward
+  # Final norm with learnable gamma
   cache.xPreFinalNorm = trackedCreate(S * n)
   gpuCopy(x, cache.xPreFinalNorm, S * n)
   cache.finalNormed = trackedCreate(S * n)
   cache.rmsF = trackedCreate(S)
-  gpu_rmsnorm_forward(x.data, cache.finalNormed.data, cache.rmsF.data, cint(S), cint(n))
+  gpu_rmsnorm_affine_fwd(x.data, m.lnFg.data, cache.finalNormed.data, cache.rmsF.data, cint(S), cint(n))
 
   # Logits
   cache.logits = trackedCreate(S * m.vocabSize)
@@ -277,8 +293,9 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 
   # Final RMSNorm backward
   let dxPreNorm = trackedCreate(S * n)
-  gpu_rmsnorm_backward(cache.xPreFinalNorm.data, dx.data,
-                       cache.rmsF.data, dxPreNorm.data, cint(S), cint(n))
+  gpu_rmsnorm_affine_bwd(cache.xPreFinalNorm.data, m.lnFg.data, dx.data,
+                         cache.rmsF.data, dxPreNorm.data, m.dlnFg.data,
+                         cint(S), cint(n))
   dx = dxPreNorm
 
   # Backward through layers in reverse
@@ -307,8 +324,9 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 
     # RMSNorm 2 backward
     let dResid2 = trackedCreate(S * n)
-    gpu_rmsnorm_backward(lc.xInput2.data, dNorm2.data,
-                         lc.rms2.data, dResid2.data, cint(S), cint(n))
+    gpu_rmsnorm_affine_bwd(lc.xInput2.data, layer.ln2g.data, dNorm2.data,
+                           lc.rms2.data, dResid2.data, m.layers[li].dln2g.data,
+                           cint(S), cint(n))
     # Add residual gradient
     gpu_add_inplace(dx.data, dResid2.data, cint(S * n))
 
@@ -384,8 +402,9 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 
     # RMSNorm 1 backward
     let dResid1 = trackedCreate(S * n)
-    gpu_rmsnorm_backward(lc.xInput1.data, dNorm1.data,
-                         lc.rms1.data, dResid1.data, cint(S), cint(n))
+    gpu_rmsnorm_affine_bwd(lc.xInput1.data, layer.ln1g.data, dNorm1.data,
+                           lc.rms1.data, dResid1.data, m.layers[li].dln1g.data,
+                           cint(S), cint(n))
 
     # Residual 1: dx for next layer = dResid1 + dResid2_skip
     gpu_add(dResid1.data, dx.data, dx.data, cint(S * n))
@@ -414,6 +433,7 @@ proc zeroGrads(m: var Model) =
   gpuZero(m.dwte)
   gpuZero(m.dwpe)
   gpuZero(m.dlmHead)
+  gpuZero(m.dlnFg)
   for i in 0 ..< m.layers.len:
     gpuZero(m.layers[i].dwq)
     gpuZero(m.layers[i].dwk)
@@ -421,6 +441,8 @@ proc zeroGrads(m: var Model) =
     gpuZero(m.layers[i].dwo)
     gpuZero(m.layers[i].dfc1)
     gpuZero(m.layers[i].dfc2)
+    gpuZero(m.layers[i].dln1g)
+    gpuZero(m.layers[i].dln2g)
 
 # ── Adam optimizer ────────────────────────────────────────────────
 
@@ -434,11 +456,14 @@ proc initAdam(m: Model): AdamState =
   addPair(result, m.wte)
   addPair(result, m.wpe)
   addPair(result, m.lmHead)
+  addPair(result, m.lnFg)
   for layer in m.layers:
     addPair(result, layer.wq)
     addPair(result, layer.wk)
     addPair(result, layer.wv)
     addPair(result, layer.wo)
+    addPair(result, layer.ln1g)
+    addPair(result, layer.ln2g)
     addPair(result, layer.fc1)
     addPair(result, layer.fc2)
 
@@ -451,11 +476,14 @@ proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
   pairs.add((m.wte, m.dwte))
   pairs.add((m.wpe, m.dwpe))
   pairs.add((m.lmHead, m.dlmHead))
+  pairs.add((m.lnFg, m.dlnFg))
   for i in 0 ..< m.layers.len:
     pairs.add((m.layers[i].wq, m.layers[i].dwq))
     pairs.add((m.layers[i].wk, m.layers[i].dwk))
     pairs.add((m.layers[i].wv, m.layers[i].dwv))
     pairs.add((m.layers[i].wo, m.layers[i].dwo))
+    pairs.add((m.layers[i].ln1g, m.layers[i].dln1g))
+    pairs.add((m.layers[i].ln2g, m.layers[i].dln2g))
     pairs.add((m.layers[i].fc1, m.layers[i].dfc1))
     pairs.add((m.layers[i].fc2, m.layers[i].dfc2))
 
@@ -526,9 +554,9 @@ when isMainModule:
   # Train
   let numSteps = 200000
   let warmupSteps = 2000
-  let peakLr = 0.01f     # match Python exactly
-  let minLr = 0.001f
-  let gradAccum = 1      # batch 1, like Python
+  let peakLr = 0.0003f
+  let minLr = 0.00003f
+  let gradAccum = 1      # batch 1 — research says it works with right settings
   trackingEnabled = true
   echo &"training {numSteps} steps (grad_accum={gradAccum})..."
 
@@ -544,6 +572,31 @@ when isMainModule:
     if seqLen < 2: continue
 
     var (cache, loss) = forward(m, tokens[0 ..< seqLen + 1], seqLen)
+    if loss != loss:  # NaN
+      echo "NaN at step ", optStep
+      proc chk(buf: GpuBuf, name: string) =
+        let d = gpuDownload(buf)
+        for i in 0 ..< d.len:
+          if d[i] != d[i]: echo "  NaN: ", name, "[", i, "]"; return
+          if d[i] > 1e30: echo "  INF: ", name, "[", i, "]=", d[i]; return
+      chk(cache.embedded, "embedded")
+      for li in 0 ..< nLayer:
+        chk(cache.layerCaches[li].xInput1, "L" & $li & ".xInput1")
+        chk(cache.layerCaches[li].xNorm1, "L" & $li & ".xNorm1")
+        chk(cache.layerCaches[li].q, "L" & $li & ".q")
+        chk(cache.layerCaches[li].k, "L" & $li & ".k")
+        chk(cache.layerCaches[li].v, "L" & $li & ".v")
+        chk(cache.layerCaches[li].attnOut, "L" & $li & ".attnOut")
+        chk(cache.layerCaches[li].xInput2, "L" & $li & ".xInput2")
+        chk(cache.layerCaches[li].xNorm2, "L" & $li & ".xNorm2")
+        chk(cache.layerCaches[li].fc1Out, "L" & $li & ".fc1Out")
+        chk(cache.layerCaches[li].reluOut, "L" & $li & ".reluOut")
+      chk(cache.xPreFinalNorm, "xPreFinalNorm")
+      chk(cache.finalNormed, "finalNormed")
+      chk(cache.logits, "logits")
+      chk(cache.logProbs, "logProbs")
+      freeStepAllocations()
+      continue
     backward(m, tokens[0 ..< seqLen + 1], seqLen, cache)
     freeStepAllocations()
 
@@ -575,7 +628,25 @@ when isMainModule:
         let progress = float32(optStep - warmupSteps) / float32(totalOptSteps - warmupSteps)
         minLr + (peakLr - minLr) * 0.5f * (1f + cos(PI.float32 * progress))
 
-    adamUpdate(m, adam, lr, optStep)
+    # Gradient clipping — clip global norm to 1.0
+    var gradPtrs: seq[pointer]
+    var gradSizes: seq[cint]
+    gradPtrs.add(m.dwte.data); gradSizes.add(cint(m.dwte.numel))
+    gradPtrs.add(m.dwpe.data); gradSizes.add(cint(m.dwpe.numel))
+    gradPtrs.add(m.dlmHead.data); gradSizes.add(cint(m.dlmHead.numel))
+    gradPtrs.add(m.dlnFg.data); gradSizes.add(cint(m.dlnFg.numel))
+    for i in 0 ..< m.layers.len:
+      gradPtrs.add(m.layers[i].dwq.data); gradSizes.add(cint(m.layers[i].dwq.numel))
+      gradPtrs.add(m.layers[i].dwk.data); gradSizes.add(cint(m.layers[i].dwk.numel))
+      gradPtrs.add(m.layers[i].dwv.data); gradSizes.add(cint(m.layers[i].dwv.numel))
+      gradPtrs.add(m.layers[i].dwo.data); gradSizes.add(cint(m.layers[i].dwo.numel))
+      gradPtrs.add(m.layers[i].dfc1.data); gradSizes.add(cint(m.layers[i].dfc1.numel))
+      gradPtrs.add(m.layers[i].dfc2.data); gradSizes.add(cint(m.layers[i].dfc2.numel))
+      gradPtrs.add(m.layers[i].dln1g.data); gradSizes.add(cint(m.layers[i].dln1g.numel))
+      gradPtrs.add(m.layers[i].dln2g.data); gradSizes.add(cint(m.layers[i].dln2g.numel))
+    clipGradNorm(gradPtrs, gradSizes, 1.0f)
+
+    adamUpdate(m, adam, lr, optStep, beta2 = 0.9999f, wd = 0.0f)
     zeroGrads(m)
     microStep = 0
     optStep += 1
