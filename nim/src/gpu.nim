@@ -270,6 +270,9 @@ proc gpu_log_softmax*(x, y: pointer, rows, cols: cint)
 proc gpu_flash_attn_fwd*(Q, K, V, O: pointer, S, hd: cint,
                           scale: cfloat, causal: cint)
   {.importc, cdecl.}
+proc gpu_flash_attn_bwd*(Q, K, V, gradO, gradQ, gradK, gradV: pointer,
+                          S, hd: cint, scale: cfloat, causal: cint)
+  {.importc, cdecl.}
 proc gpu_cross_entropy_loss*(log_probs: pointer, target, vocab: cint): cfloat
   {.importc, cdecl.}
 

@@ -332,24 +332,21 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     gpuSgemm(1, S, n, n, dx, layer.wo, dAttnOut)
     gpuSgemm(5, n, n, S, dx, lc.attnOut, m.layers[li].dwo)
 
-    # Multi-head attention backward
+    # Multi-head flash attention backward
+    # Fused: recomputes attention with online softmax + computes dQ, dK, dV
+    # Numerically stable — same as forward, overflow impossible
     let dq = trackedCreate(S * n)
     let dk = trackedCreate(S * n)
     let dv = trackedCreate(S * n)
     let scale = 1.0f / sqrt(float32(headDim))
 
     let doutH = trackedCreate(S * headDim)
-    let dvH = trackedCreate(S * headDim)
-    let dw = trackedCreate(S * S)
-    let dScores = trackedCreate(S * S)
-    let dqH = trackedCreate(S * headDim)
-    let dkH = trackedCreate(S * headDim)
     let qH = trackedCreate(S * headDim)
     let kH = trackedCreate(S * headDim)
     let vH = trackedCreate(S * headDim)
-
-    let scores = trackedCreate(S * S)
-    let weights = trackedCreate(S * S)
+    let dqH = trackedCreate(S * headDim)
+    let dkH = trackedCreate(S * headDim)
+    let dvH = trackedCreate(S * headDim)
 
     for h in 0 ..< nHead:
       extractHead(dAttnOut, doutH, h, S, n, headDim)
@@ -357,40 +354,14 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
       extractHead(lc.k, kH, h, S, n, headDim)
       extractHead(lc.v, vH, h, S, n, headDim)
 
-      # Recompute attention weights for backward (flash attn doesn't store them)
-      gpuSgemm(2, S, S, headDim, qH, kH, scores)
-      causalMask(scores, scale, S)
-      gpu_clamp(scores.data, -80.0f, 80.0f, cint(S * S))  # safe — only for backward recompute
-      softmaxFwd(scores, weights, S, S)
+      gpuZero(dqH); gpuZero(dkH); gpuZero(dvH)
+      gpu_flash_attn_bwd(qH.data, kH.data, vH.data, doutH.data,
+                         dqH.data, dkH.data, dvH.data,
+                         cint(S), cint(headDim), scale, 1)
 
-      # dWeights = dAttnOut_h @ V_h^T
-      gpuSgemm(2, S, S, headDim, doutH, vH, dw)
-      # dV_h = Weights^T @ dAttnOut_h
-      gpuSgemm(4, S, headDim, S, weights, doutH, dvH)
-      insertHeadAcc(dvH, dv, h, S, n, headDim)
-
-      # Causal softmax backward — CPU for numerical stability
-      let dwCpu = gpuDownload(dw)
-      let wtCpu = gpuDownload(weights)
-      var dScoresCpu = newSeq[float32](S * S)
-      for i in 0 ..< S:
-        var dot = 0.0f
-        for j in 0 .. i:
-          dot += dwCpu[i * S + j] * wtCpu[i * S + j]
-        for j in 0 .. i:
-          dScoresCpu[i * S + j] =
-            wtCpu[i * S + j] * (dwCpu[i * S + j] - dot) * scale
-      gpuUpload(dScores, dScoresCpu)
-
-      # dQ_h = dScores @ K_h
-      extractHead(lc.k, kH, h, S, n, headDim)
-      gpuSgemm(0, S, headDim, S, dScores, kH, dqH)
       insertHeadAcc(dqH, dq, h, S, n, headDim)
-
-      # dK_h = dScores^T @ Q_h
-      extractHead(lc.q, qH, h, S, n, headDim)
-      gpuSgemm(4, S, headDim, S, dScores, qH, dkH)
       insertHeadAcc(dkH, dk, h, S, n, headDim)
+      insertHeadAcc(dvH, dv, h, S, n, headDim)
 
     # QKV projection backward
     let dNorm1 = trackedCreate(S * n)

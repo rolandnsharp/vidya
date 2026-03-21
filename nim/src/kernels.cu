@@ -746,4 +746,102 @@ void gpu_flash_attn_fwd(const float *Q, const float *K, const float *V,
     k_flash_attn_fwd<<<S, threads>>>(Q, K, V, O, S, hd, scale, causal);
 }
 
+/* ── Flash Attention Backward ─────────────────────────────────────
+ *
+ * Recomputes attention weights using online softmax (same as forward),
+ * then computes gradients for Q, K, V. Never stores the full S×S
+ * matrix. Numerically stable by construction. */
+
+__global__ void k_flash_attn_bwd(
+    const float *Q, const float *K, const float *V,
+    const float *dO,    /* gradient of attention output [S, hd] */
+    float *dQ, float *dK, float *dV,  /* output gradients [S, hd] */
+    int S, int hd, float scale, int causal
+) {
+    int row = blockIdx.x;   /* query position */
+    int j = threadIdx.x;    /* head dimension index */
+    if (row >= S || j >= hd) return;
+
+    const float *q = Q + row * hd;
+    const float *do_row = dO + row * hd;
+
+    /* First pass: recompute attention weights using online softmax */
+    /* We need the full weight vector for this row to compute dQ, dK, dV */
+    /* Since S can be large, we do two passes:
+       Pass 1: compute m (max) and l (sum) for online softmax
+       Pass 2: compute gradients using the softmax values */
+
+    int max_col = causal ? (row + 1) : S;
+
+    /* Pass 1: find max score and sum of exp for this row */
+    float m = -FLT_MAX;
+    for (int col = 0; col < max_col; col++) {
+        float score = 0.0f;
+        for (int d = 0; d < hd; d++)
+            score += q[d] * K[col * hd + d];
+        score *= scale;
+        m = fmaxf(m, score);
+    }
+    float l = 0.0f;
+    for (int col = 0; col < max_col; col++) {
+        float score = 0.0f;
+        for (int d = 0; d < hd; d++)
+            score += q[d] * K[col * hd + d];
+        score *= scale;
+        l += expf(score - m);
+    }
+
+    /* Compute D = sum_col(dO * O) — needed for softmax backward
+     * But we don't have O stored per-element. Instead:
+     * D = sum_col(p_col * sum_d(dO[d] * V[col,d])) */
+    float D = 0.0f;
+    for (int col = 0; col < max_col; col++) {
+        float score = 0.0f;
+        for (int d = 0; d < hd; d++)
+            score += q[d] * K[col * hd + d];
+        score *= scale;
+        float p = expf(score - m) / l;
+        float dov = 0.0f;
+        for (int d = 0; d < hd; d++)
+            dov += do_row[d] * V[col * hd + d];
+        D += p * dov;
+    }
+
+    /* Pass 2: compute gradients */
+    /* dV[col, j] += p[row, col] * dO[row, j] */
+    /* dQ[row, j] += sum_col(p[row,col] * (dO·V[col] - D) * scale * K[col,j]) */
+    float dq_acc = 0.0f;
+    for (int col = 0; col < max_col; col++) {
+        float score = 0.0f;
+        for (int d = 0; d < hd; d++)
+            score += q[d] * K[col * hd + d];
+        score *= scale;
+        float p = expf(score - m) / l;
+
+        /* dV[col, j] += p * dO[row, j] */
+        atomicAdd(&dV[col * hd + j], p * do_row[j]);
+
+        /* Softmax backward: dScore = p * (dO·V - D) */
+        float dov = 0.0f;
+        for (int d = 0; d < hd; d++)
+            dov += do_row[d] * V[col * hd + d];
+        float ds = p * (dov - D) * scale;
+
+        /* dQ[row, j] += ds * K[col, j] */
+        dq_acc += ds * K[col * hd + j];
+
+        /* dK[col, j] += ds * Q[row, j] */
+        atomicAdd(&dK[col * hd + j], ds * q[j]);
+    }
+    atomicAdd(&dQ[row * hd + j], dq_acc);
+}
+
+void gpu_flash_attn_bwd(const float *Q, const float *K, const float *V,
+                        const float *dO, float *dQ, float *dK, float *dV,
+                        int S, int hd, float scale, int causal) {
+    int threads = hd < 256 ? hd : 256;
+    k_flash_attn_bwd<<<S, threads>>>(Q, K, V, dO, dQ, dK, dV,
+                                      S, hd, scale, causal);
+}
+
 } /* extern "C" */
