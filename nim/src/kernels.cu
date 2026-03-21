@@ -682,4 +682,68 @@ float gpu_cross_entropy_loss(const float *log_probs, int target, int vocab) {
     return -lp;
 }
 
+/* ── Flash Attention (simplified) ─────────────────────────────────
+ *
+ * Fused attention: Q @ K^T → scale → causal mask → softmax → @ V
+ * All in one kernel. Uses online softmax — never stores the full
+ * S×S attention matrix. Numerically stable by construction.
+ *
+ * For simplicity, this processes one head at a time with one block
+ * per query position. Not as optimized as Dao's Flash Attention
+ * but correct, stable, and much better than separate kernels. */
+
+__global__ void k_flash_attn_fwd(
+    const float *Q,     /* [S, hd] */
+    const float *K,     /* [S, hd] */
+    const float *V,     /* [S, hd] */
+    float *O,           /* [S, hd] output */
+    int S, int hd, float scale,
+    int causal          /* 1 = causal mask, 0 = no mask */
+) {
+    int row = blockIdx.x;   /* query position */
+    if (row >= S) return;
+    int j = threadIdx.x;    /* head dimension index */
+    if (j >= hd) return;
+
+    const float *q = Q + row * hd;
+
+    /* Online softmax state */
+    float m = -FLT_MAX;  /* running max */
+    float l = 0.0f;      /* running sum of exp */
+    float acc = 0.0f;    /* running output accumulator (unnormalized) */
+
+    int max_col = causal ? (row + 1) : S;
+
+    for (int col = 0; col < max_col; col++) {
+        /* Compute attention score for this (row, col) pair */
+        const float *k = K + col * hd;
+        float score = 0.0f;
+        for (int d = 0; d < hd; d++)
+            score += q[d] * k[d];
+        score *= scale;
+
+        /* Online softmax update */
+        float m_new = fmaxf(m, score);
+        float exp_old = expf(m - m_new);  /* rescale old accumulator */
+        float exp_new = expf(score - m_new);
+        float l_new = l * exp_old + exp_new;
+
+        /* Rescale accumulator and add new value */
+        const float *v = V + col * hd;
+        acc = acc * (l * exp_old / l_new) + v[j] * (exp_new / l_new);
+
+        m = m_new;
+        l = l_new;
+    }
+
+    O[row * hd + j] = acc;
+}
+
+void gpu_flash_attn_fwd(const float *Q, const float *K, const float *V,
+                        float *O, int S, int hd, float scale, int causal) {
+    /* One block per query position, hd threads per block */
+    int threads = hd < 256 ? hd : 256;
+    k_flash_attn_fwd<<<S, threads>>>(Q, K, V, O, S, hd, scale, causal);
+}
+
 } /* extern "C" */
