@@ -611,4 +611,75 @@ void gpu_zero_upper(float *data, int seq_len) {
     k_zero_upper<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(data, seq_len);
 }
 
+/* ── Clamp ────────────────────────────────────────────────────────── */
+
+__global__ void k_clamp(float *data, float minv, float maxv, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    data[i] = fminf(fmaxf(data[i], minv), maxv);
+}
+
+void gpu_clamp(float *data, float minv, float maxv, int n) {
+    k_clamp<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(data, minv, maxv, n);
+}
+
+/* ── Log-softmax (numerically stable) ─────────────────────────────
+ *
+ * log_softmax(x) = x - log(sum(exp(x - max(x))))
+ * Never computes exp() then log() separately. No overflow. */
+
+__global__ void k_log_softmax(const float *x, float *y, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xi = x + row * cols;
+    float *yi = y + row * cols;
+
+    extern __shared__ float sdata[];
+
+    /* Find max */
+    float mx = -FLT_MAX;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x)
+        mx = fmaxf(mx, xi[j]);
+    sdata[threadIdx.x] = mx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float row_max = sdata[0];
+
+    /* Sum of exp(x - max) */
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x)
+        sum += expf(xi[j] - row_max);
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s)
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float log_sum = logf(sdata[0]);
+
+    /* log_softmax = x - max - log_sum */
+    for (int j = threadIdx.x; j < cols; j += blockDim.x)
+        yi[j] = xi[j] - row_max - log_sum;
+}
+
+/* Cross-entropy from log-softmax: loss = -log_probs[target]
+ * Backward: d_logits[i] = exp(log_probs[i]) - (i == target ? 1 : 0)
+ * This is the STABLE version — no separate softmax + NLL. */
+
+void gpu_log_softmax(const float *x, float *y, int rows, int cols) {
+    int threads = cols < 256 ? cols : 256;
+    k_log_softmax<<<rows, threads, threads * sizeof(float)>>>(x, y, rows, cols);
+}
+
+float gpu_cross_entropy_loss(const float *log_probs, int target, int vocab) {
+    float lp;
+    cudaMemcpy(&lp, log_probs + target, sizeof(float), cudaMemcpyDeviceToHost);
+    return -lp;
+}
+
 } /* extern "C" */

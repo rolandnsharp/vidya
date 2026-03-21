@@ -232,6 +232,12 @@ proc gpu_insert_kv_head_acc*(src, dst: pointer,
   {.importc, cdecl.}
 proc gpu_zero_upper*(data: pointer, seq_len: cint)
   {.importc, cdecl.}
+proc gpu_clamp*(data: pointer, minv, maxv: cfloat, n: cint)
+  {.importc, cdecl.}
+proc gpu_log_softmax*(x, y: pointer, rows, cols: cint)
+  {.importc, cdecl.}
+proc gpu_cross_entropy_loss*(log_probs: pointer, target, vocab: cint): cfloat
+  {.importc, cdecl.}
 
 # ── High-level wrappers using GpuBuf ─────────────────────────────
 

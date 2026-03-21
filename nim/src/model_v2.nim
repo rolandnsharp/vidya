@@ -20,7 +20,7 @@
 ## to match parameter count of 4 * nEmbd GELU FFN with two projections.
 
 import gpu
-import std/[math, random, streams, os, strformat]
+import std/[math, random, streams, strformat]
 
 const
   nLayerV2*   = 12
@@ -44,6 +44,7 @@ type
     attnWk*: GpuParamV2          # [nKvHead * headDim, nEmbd] — fewer KV heads
     attnWv*: GpuParamV2          # [nKvHead * headDim, nEmbd]
     attnWo*: GpuParamV2          # [nEmbd, nEmbd]
+    qNorm*, kNorm*: GpuParamV2   # QK-Norm: bounds Q·K^T, prevents overflow
     mlpWgate*: GpuParamV2        # [ffnDim, nEmbd] — SwiGLU gate
     mlpWup*: GpuParamV2          # [ffnDim, nEmbd] — SwiGLU up
     mlpWdown*: GpuParamV2        # [nEmbd, ffnDim] — down projection
@@ -113,6 +114,8 @@ proc initGpuModelV2*(vocabSize: int): GpuModelV2 =
       attnWk: makeParamV2(nKvDim * nEmbdV2),
       attnWv: makeParamV2(nKvDim * nEmbdV2),
       attnWo: makeParamV2(nEmbdV2 * nEmbdV2, residualStd),
+      qNorm: makeOnesParamV2(nEmbdV2),
+      kNorm: makeOnesParamV2(nKvDim),
       mlpWgate: makeParamV2(ffnDimV2 * nEmbdV2),
       mlpWup: makeParamV2(ffnDimV2 * nEmbdV2),
       mlpWdown: makeParamV2(nEmbdV2 * ffnDimV2, residualStd),
@@ -139,6 +142,8 @@ proc collectParamsV2*(m: var GpuModelV2): seq[ptr GpuParamV2] =
     result.add(addr m.layers[i].attnWk)
     result.add(addr m.layers[i].attnWv)
     result.add(addr m.layers[i].attnWo)
+    result.add(addr m.layers[i].qNorm)
+    result.add(addr m.layers[i].kNorm)
     result.add(addr m.layers[i].mlpWgate)
     result.add(addr m.layers[i].mlpWup)
     result.add(addr m.layers[i].mlpWdown)
@@ -170,6 +175,8 @@ proc saveCheckpointV2*(m: GpuModelV2, filename: string) =
     s.writeParamV2(m.layers[i].attnWk)
     s.writeParamV2(m.layers[i].attnWv)
     s.writeParamV2(m.layers[i].attnWo)
+    s.writeParamV2(m.layers[i].qNorm)
+    s.writeParamV2(m.layers[i].kNorm)
     s.writeParamV2(m.layers[i].mlpWgate)
     s.writeParamV2(m.layers[i].mlpWup)
     s.writeParamV2(m.layers[i].mlpWdown)
@@ -192,6 +199,8 @@ proc loadCheckpointV2*(m: var GpuModelV2, filename: string) =
     s.readParamV2(m.layers[i].attnWk)
     s.readParamV2(m.layers[i].attnWv)
     s.readParamV2(m.layers[i].attnWo)
+    s.readParamV2(m.layers[i].qNorm)
+    s.readParamV2(m.layers[i].kNorm)
     s.readParamV2(m.layers[i].mlpWgate)
     s.readParamV2(m.layers[i].mlpWup)
     s.readParamV2(m.layers[i].mlpWdown)

@@ -6,8 +6,6 @@
 import model, bpe, forward, train
 import std/[os, times, strformat]
 
-import std/[os]
-
 let baseDir = getAppDir().parentDir()  # nim/ directory
 let vidyaRoot = baseDir.parentDir()    # vidya/ directory
 let dataFile = vidyaRoot / "chat_input.txt"

@@ -4,7 +4,7 @@
 ## Initialised with random weights on CPU, then uploaded.
 
 import gpu
-import std/[math, random, streams, os, strformat]
+import std/[math, random, streams, strformat]
 
 const
   nLayer*   = 8
@@ -24,6 +24,7 @@ type
 
   GpuLayer* = object
     attnWq*, attnWk*, attnWv*, attnWo*: GpuParam
+    qNorm*, kNorm*: GpuParam     # QK-Norm
     mlpFc1*, mlpFc2*: GpuParam
     ln1*, ln2*: GpuParam
 
@@ -90,6 +91,8 @@ proc initGpuModel*(vocabSize: int): GpuModel =
       attnWk: makeParam(nEmbd * nEmbd),
       attnWv: makeParam(nEmbd * nEmbd),
       attnWo: makeParam(nEmbd * nEmbd, residualStd),
+      qNorm: makeOnesParam(nEmbd),
+      kNorm: makeOnesParam(nEmbd),
       mlpFc1: makeParam(ffnDim * nEmbd),
       mlpFc2: makeParam(nEmbd * ffnDim, residualStd),
       ln1: makeOnesParam(nEmbd),
@@ -143,6 +146,8 @@ proc saveCheckpoint*(m: GpuModel, filename: string) =
     s.writeParam(m.layers[i].attnWk)
     s.writeParam(m.layers[i].attnWv)
     s.writeParam(m.layers[i].attnWo)
+    s.writeParam(m.layers[i].qNorm)
+    s.writeParam(m.layers[i].kNorm)
     s.writeParam(m.layers[i].mlpFc1)
     s.writeParam(m.layers[i].mlpFc2)
     s.writeParam(m.layers[i].ln1)
@@ -165,6 +170,8 @@ proc loadCheckpoint*(m: var GpuModel, filename: string) =
     s.readParam(m.layers[i].attnWk)
     s.readParam(m.layers[i].attnWv)
     s.readParam(m.layers[i].attnWo)
+    s.readParam(m.layers[i].qNorm)
+    s.readParam(m.layers[i].kNorm)
     s.readParam(m.layers[i].mlpFc1)
     s.readParam(m.layers[i].mlpFc2)
     s.readParam(m.layers[i].ln1)
@@ -181,6 +188,8 @@ proc collectParams*(m: var GpuModel): seq[ptr GpuParam] =
     result.add(addr m.layers[i].attnWk)
     result.add(addr m.layers[i].attnWv)
     result.add(addr m.layers[i].attnWo)
+    result.add(addr m.layers[i].qNorm)
+    result.add(addr m.layers[i].kNorm)
     result.add(addr m.layers[i].mlpFc1)
     result.add(addr m.layers[i].mlpFc2)
     result.add(addr m.layers[i].ln1)

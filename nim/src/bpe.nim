@@ -1,7 +1,7 @@
 ## bpe.nim — Byte Pair Encoding tokenizer
 ##
-## Trains on a corpus of text, learns 2000 merge rules, produces
-## a vocabulary of ~2188 tokens (185 byte-level + 2000 merges + 3 special).
+## Trains on a corpus of text, learns merge rules (default 2000), produces
+## a vocabulary of 256 byte-level + nMerges + 3 special tokens.
 ##
 ## Can save/load to a portable binary format (not OCaml Marshal).
 

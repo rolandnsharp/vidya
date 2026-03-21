@@ -1,6 +1,6 @@
 ## ag_forward_v2.nim — V2 forward pass with GQA + SwiGLU
 ##
-## GQA: 16 Q heads share 4 KV heads. Each KV head serves 4 Q heads.
+## GQA: 12 Q heads share 4 KV heads. Each KV head serves 3 Q heads.
 ## SwiGLU: gate + up projections with swish gating instead of GELU.
 ## Everything else same as V1.
 
@@ -72,6 +72,7 @@ proc agGqaAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
     # Scores = Q_h @ K_h^T
     gpuSgemm(2, seqLen, seqLen, hd, qH, kH, scores)
     causalMask(scores, scale, seqLen)
+    gpu_clamp(scores.data, -65000.0f, 65000.0f, cint(seqLen * seqLen))
     softmaxFwd(scores, weights, seqLen, seqLen)
 
     allWeights[h] = trackedCreate(seqLen * seqLen)
@@ -157,17 +158,21 @@ proc agTransformerBlockV2*(x: Node, layer: GpuLayerV2,
   let wk = pn(layer.attnWk)
   let wv = pn(layer.attnWv)
   let wo = pn(layer.attnWo)
+  let qNormP = pn(layer.qNorm)
+  let kNormP = pn(layer.kNorm)
   let wgate = pn(layer.mlpWgate)
   let wup = pn(layer.mlpWup)
   let wdown = pn(layer.mlpWdown)
   let ln1 = pn(layer.ln1)
   let ln2 = pn(layer.ln2)
 
-  # Attention sub-block
+  # Attention sub-block with QK-Norm
   let xn = agRmsNormAffine(x, ln1, seqLen, n)
-  let q = agMatmul(wq, xn, seqLen, n, n)
-  let k = agMatmul(wk, xn, seqLen, nKvDim, n)     # fewer KV heads
-  let v = agMatmul(wv, xn, seqLen, nKvDim, n)     # fewer KV heads
+  let qRaw = agMatmul(wq, xn, seqLen, n, n)
+  let kRaw = agMatmul(wk, xn, seqLen, nKvDim, n)
+  let q = agRmsNormAffine(qRaw, qNormP, seqLen, n)         # QK-Norm: bounds Q
+  let k = agRmsNormAffine(kRaw, kNormP, seqLen, nKvDim)    # QK-Norm: bounds K
+  let v = agMatmul(wv, xn, seqLen, nKvDim, n)
   let attnOut = agGqaAttention(q, k, v, ropeCos, ropeSin, seqLen)
   let projected = agDropout(agMatmul(wo, attnOut, seqLen, n, n))
   let afterAttn = agAdd(x, projected)

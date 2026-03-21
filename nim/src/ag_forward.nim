@@ -5,7 +5,6 @@
 ## Then Adam updates the weights. The model learns.
 
 import gpu, gpu_model, autograd
-import std/math
 
 proc agTransformerBlock(x: Node, layer: GpuLayer, ropeCos, ropeSin: GpuBuf,
                         seqLen: int): Node =
@@ -15,15 +14,17 @@ proc agTransformerBlock(x: Node, layer: GpuLayer, ropeCos, ropeSin: GpuBuf,
   let wk = paramNode(layer.attnWk)
   let wv = paramNode(layer.attnWv)
   let wo = paramNode(layer.attnWo)
+  let qNormP = paramNode(layer.qNorm)
+  let kNormP = paramNode(layer.kNorm)
   let fc1 = paramNode(layer.mlpFc1)
   let fc2 = paramNode(layer.mlpFc2)
   let ln1 = paramNode(layer.ln1)
   let ln2 = paramNode(layer.ln2)
 
-  # Attention sub-block
+  # Attention sub-block with QK-Norm
   let xn = agRmsNormAffine(x, ln1, seqLen, n)
-  let q = agMatmul(wq, xn, seqLen, n, n)
-  let k = agMatmul(wk, xn, seqLen, n, n)
+  let q = agRmsNormAffine(agMatmul(wq, xn, seqLen, n, n), qNormP, seqLen, n)
+  let k = agRmsNormAffine(agMatmul(wk, xn, seqLen, n, n), kNormP, seqLen, n)
   let v = agMatmul(wv, xn, seqLen, n, n)
   let attnOut = agAttention(q, k, v, ropeCos, ropeSin, seqLen)
   let projected = agMatmul(wo, attnOut, seqLen, n, n)

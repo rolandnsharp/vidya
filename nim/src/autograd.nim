@@ -149,11 +149,13 @@ proc agSwiGLU*(gate, up: Node): Node =
                    gate.grad.data, up.grad.data, cint(n))
 
 proc agCrossEntropy*(logits: Node, target: int, vocabSize: int): Node =
-  ## Fused softmax + NLL. Backward is (probs - one_hot), bounded [-1, 1].
-  ## This avoids the 1/p gradient explosion from separate softmax + NLL.
-  let yBuf = trackedCreate(vocabSize)
-  softmaxFwd(logits.data, yBuf, 1, vocabSize)
-  let lossVal = gpu_nll_fwd(yBuf.data, cint(target))
+  ## Numerically stable cross-entropy using log-softmax.
+  ## Forward: loss = -log_softmax(logits)[target]
+  ## Backward: d_logits = softmax(logits) - one_hot(target)
+  ## No exp() overflow. No 1/p explosion. Bounded [-1, 1].
+  let logProbsBuf = trackedCreate(vocabSize)
+  gpu_log_softmax(logits.data.data, logProbsBuf.data, 1, cint(vocabSize))
+  let lossVal = gpu_cross_entropy_loss(logProbsBuf.data, cint(target), cint(vocabSize))
   let lossBuf = trackedCreate(1)
   gpuUpload(lossBuf, @[lossVal])
   result = newNode(lossBuf, 1, @[logits])
@@ -161,15 +163,14 @@ proc agCrossEntropy*(logits: Node, target: int, vocabSize: int): Node =
   result.backwardFn = proc() =
     let dy = gpuDownload(yGrad)
     let upstream = dy[0]
-    # Gradient of cross-entropy w.r.t. logits = upstream * (probs - one_hot)
-    # probs are already in yBuf from the forward
-    var probsCpu = gpuDownload(yBuf)
+    # probs = exp(log_probs), then grad = upstream * (probs - one_hot)
+    var logProbsCpu = gpuDownload(logProbsBuf)
+    var gradCpu = newSeq[float32](vocabSize)
     for i in 0 ..< vocabSize:
-      probsCpu[i] = upstream * probsCpu[i]
-    probsCpu[target] -= upstream
-    # Upload gradient into logits.grad (accumulate)
+      gradCpu[i] = upstream * exp(logProbsCpu[i])
+    gradCpu[target] -= upstream
     let gradBuf = trackedCreate(vocabSize)
-    gpuUpload(gradBuf, probsCpu)
+    gpuUpload(gradBuf, gradCpu)
     gpu_add_inplace(logits.grad.data, gradBuf.data, cint(vocabSize))
 
 proc agNll*(probs: Node, target: int, vocabSize: int): Node =
@@ -216,6 +217,8 @@ proc agAttention*(q, k, v: Node, ropeCos, ropeSin: GpuBuf,
     extractHead(v.data, vH, h, seqLen, n, hd)
     gpuSgemm(2, seqLen, seqLen, hd, qH, kH, scores)
     causalMask(scores, scale, seqLen)
+    # Clamp scores to prevent exp() overflow in softmax
+    gpu_clamp(scores.data, -65000.0f, 65000.0f, cint(seqLen * seqLen))
     softmaxFwd(scores, weights, seqLen, seqLen)
     allWeights[h] = trackedCreate(seqLen * seqLen)
     gpuCopy(weights, allWeights[h], seqLen * seqLen)
