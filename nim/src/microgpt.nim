@@ -12,11 +12,11 @@ import std/[math, random, strformat, os, streams, times]
 # ── Configuration ─────────────────────────────────────────────────
 
 const
-  nLayer   = 4
-  nEmbd    = 256
+  nLayer   = 1      # match Python microGPT exactly
+  nEmbd    = 16
   nHead    = 4
-  headDim  = nEmbd div nHead
-  blockSize = 256
+  headDim  = nEmbd div nHead  # 4
+  blockSize = 16
   ffnMul   = 4
 
 # ── Model ─────────────────────────────────────────────────────────
@@ -526,38 +526,64 @@ when isMainModule:
   # Train
   let numSteps = 200000
   let warmupSteps = 2000
-  let peakLr = 0.00003f  # very conservative — find stable ceiling
-  let minLr = 0.00003f
+  let peakLr = 0.01f     # match Python exactly
+  let minLr = 0.001f
+  let gradAccum = 1      # batch 1, like Python
   trackingEnabled = true
-  echo &"training {numSteps} steps..."
+  echo &"training {numSteps} steps (grad_accum={gradAccum})..."
 
   let tStart = cpuTime()
   var lossSum = 0.0f
-  let logInterval = 100
+  var microStep = 0
+  var optStep = 0
+  let logInterval = 50  # in optimizer steps
 
   for step in 0 ..< numSteps:
     let tokens = tokenizedDocs[order[step mod order.len]]
     let seqLen = min(blockSize, tokens.len - 1)
     if seqLen < 2: continue
 
-    zeroGrads(m)
     var (cache, loss) = forward(m, tokens[0 ..< seqLen + 1], seqLen)
     backward(m, tokens[0 ..< seqLen + 1], seqLen, cache)
-    freeStepAllocations()  # frees ALL tracked buffers from this step
-
-    # LR schedule
-    let lr = if step < warmupSteps:
-        peakLr * float32(step) / float32(warmupSteps)
-      else:
-        let progress = float32(step - warmupSteps) / float32(numSteps - warmupSteps)
-        minLr + (peakLr - minLr) * 0.5f * (1f + cos(PI.float32 * progress))
-
-    adamUpdate(m, adam, lr, step)
+    freeStepAllocations()
 
     lossSum += loss
-    if (step + 1) mod logInterval == 0:
+    microStep += 1
+
+    if microStep < gradAccum:
+      continue
+
+    # Scale gradients by 1/gradAccum
+    proc scaleAllGrads(m: var Model, s: float32) =
+      gpu_scale(m.dwte.data, s, m.dwte.data, cint(m.dwte.numel))
+      gpu_scale(m.dwpe.data, s, m.dwpe.data, cint(m.dwpe.numel))
+      gpu_scale(m.dlmHead.data, s, m.dlmHead.data, cint(m.dlmHead.numel))
+      for i in 0 ..< m.layers.len:
+        gpu_scale(m.layers[i].dwq.data, s, m.layers[i].dwq.data, cint(m.layers[i].dwq.numel))
+        gpu_scale(m.layers[i].dwk.data, s, m.layers[i].dwk.data, cint(m.layers[i].dwk.numel))
+        gpu_scale(m.layers[i].dwv.data, s, m.layers[i].dwv.data, cint(m.layers[i].dwv.numel))
+        gpu_scale(m.layers[i].dwo.data, s, m.layers[i].dwo.data, cint(m.layers[i].dwo.numel))
+        gpu_scale(m.layers[i].dfc1.data, s, m.layers[i].dfc1.data, cint(m.layers[i].dfc1.numel))
+        gpu_scale(m.layers[i].dfc2.data, s, m.layers[i].dfc2.data, cint(m.layers[i].dfc2.numel))
+    scaleAllGrads(m, 1.0f / float32(gradAccum))
+
+    # LR schedule
+    let totalOptSteps = numSteps div gradAccum
+    let lr = if optStep < warmupSteps:
+        peakLr * float32(optStep) / float32(warmupSteps)
+      else:
+        let progress = float32(optStep - warmupSteps) / float32(totalOptSteps - warmupSteps)
+        minLr + (peakLr - minLr) * 0.5f * (1f + cos(PI.float32 * progress))
+
+    adamUpdate(m, adam, lr, optStep)
+    zeroGrads(m)
+    microStep = 0
+    optStep += 1
+
+    if optStep mod logInterval == 0:
       let elapsed = cpuTime() - tStart
-      let sps = float(step + 1) / elapsed
-      let eta = float(numSteps - step - 1) / sps
-      echo &"step {step + 1:>6} / {numSteps} | loss {lossSum / float32(logInterval):.4f} | lr {lr:.6f} | {sps:.1f} steps/s | {formatDuration(elapsed)} elapsed | {formatDuration(eta)} remaining"
+      let opsps = float(optStep) / elapsed
+      let totalOpt = numSteps div gradAccum
+      let eta = float(totalOpt - optStep) / max(opsps, 0.01)
+      echo &"opt {optStep:>5} / {totalOpt} | loss {lossSum / float32(logInterval * gradAccum):.4f} | lr {lr:.6f} | {opsps:.1f} opt/s | {formatDuration(elapsed)} elapsed | {formatDuration(eta)} remaining"
       lossSum = 0.0f
