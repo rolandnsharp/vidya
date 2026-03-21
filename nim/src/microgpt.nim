@@ -100,19 +100,16 @@ proc initModel(vocabSize: int): Model =
 
 type
   LayerCache = object
-    xResidual1: GpuBuf   # input to attention block (for residual backward)
-    xInput1: GpuBuf      # ORIGINAL input to rmsnorm1 (needed for backward!)
-    xNorm1: GpuBuf       # after first rmsnorm
-    rms1: GpuBuf         # rms value for rmsnorm backward
-    q, k, v: GpuBuf      # after projection
-    attnWeights: seq[GpuBuf]  # per-head softmax weights
-    attnOut: GpuBuf       # concatenated attention output
-    xResidual2: GpuBuf   # input to MLP block
-    xInput2: GpuBuf      # ORIGINAL input to rmsnorm2 (needed for backward!)
-    xNorm2: GpuBuf       # after second rmsnorm
-    rms2: GpuBuf
-    fc1Out: GpuBuf       # after fc1 (pre-relu)
-    reluOut: GpuBuf      # after relu
+    x1: GpuBuf           # input to layer (for residual + rmsnorm backward)
+    xNorm1: GpuBuf       # after rmsnorm1
+    rms1: GpuBuf         # rms value for rmsnorm1 backward
+    q, k, v: GpuBuf      # QKV projections
+    attnOut: GpuBuf       # flash attention output
+    x2: GpuBuf           # after first residual (for residual + rmsnorm backward)
+    xNorm2: GpuBuf       # after rmsnorm2
+    rms2: GpuBuf         # rms value for rmsnorm2 backward
+    fc1Out: GpuBuf       # after fc1 (pre-activation)
+    geluOut: GpuBuf      # after GELU
 
   ForwardCache = object
     embedded: GpuBuf      # token + position embeddings
@@ -160,13 +157,9 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     var lc: LayerCache
     let layer = m.layers[li]
 
-    # Save residual
-    lc.xResidual1 = trackedCreate(S * n)
-    gpuCopy(x, lc.xResidual1, S * n)
-
-    # RMSNorm 1 with learnable gamma — save original input for backward
-    lc.xInput1 = trackedCreate(S * n)
-    gpuCopy(x, lc.xInput1, S * n)
+    # Save input for residual + rmsnorm backward
+    lc.x1 = trackedCreate(S * n)
+    gpuCopy(x, lc.x1, S * n)
     lc.xNorm1 = trackedCreate(S * n)
     lc.rms1 = trackedCreate(S)
     gpu_rmsnorm_affine_fwd(x.data, layer.ln1g.data, lc.xNorm1.data, lc.rms1.data, cint(S), cint(n))
@@ -183,7 +176,6 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     # Online softmax never computes exp(large_number). No overflow possible.
     let scale = 1.0f / sqrt(float32(headDim))
     lc.attnOut = trackedCreate(S * n)
-    lc.attnWeights = newSeq[GpuBuf](nHead)  # not used by flash attn but kept for backward
 
     let qH = trackedCreate(S * headDim)
     let kH = trackedCreate(S * headDim)
@@ -199,23 +191,17 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
       gpu_flash_attn_fwd(qH.data, kH.data, vH.data, attnH.data,
                          cint(S), cint(headDim), scale, 1)
 
-      # Save weights for backward (recompute from Q,K in backward)
-      lc.attnWeights[h] = trackedCreate(S * S)  # placeholder — flash attn recomputes
-
       insertHead(attnH, lc.attnOut, h, S, n, headDim)
 
     # Output projection
     var projected = trackedCreate(S * n)
     gpuSgemm(2, S, n, n, lc.attnOut, layer.wo, projected)
 
-    # Residual 1
-    lc.xResidual2 = trackedCreate(S * n)
-    gpu_add(lc.xResidual1.data, projected.data, lc.xResidual2.data, cint(S * n))
-    x = lc.xResidual2
+    # Residual 1: x2 = x1 + projected
+    lc.x2 = trackedCreate(S * n)
+    gpu_add(lc.x1.data, projected.data, lc.x2.data, cint(S * n))
+    x = lc.x2
 
-    # RMSNorm 2 with learnable gamma — save original input for backward
-    lc.xInput2 = trackedCreate(S * n)
-    gpuCopy(x, lc.xInput2, S * n)
     lc.xNorm2 = trackedCreate(S * n)
     lc.rms2 = trackedCreate(S)
     gpu_rmsnorm_affine_fwd(x.data, layer.ln2g.data, lc.xNorm2.data, lc.rms2.data, cint(S), cint(n))
@@ -224,16 +210,15 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     lc.fc1Out = trackedCreate(S * ffnMul * n)
     gpuSgemm(2, S, ffnMul * n, n, lc.xNorm2, layer.fc1, lc.fc1Out)
 
-    lc.reluOut = trackedCreate(S * ffnMul * n)
-    gpu_gelu_fwd(lc.fc1Out.data, lc.reluOut.data, cint(S * ffnMul * n))
-    # TODO: microGPT uses ReLU not GELU. For now GELU is fine.
+    lc.geluOut = trackedCreate(S * ffnMul * n)
+    gpu_gelu_fwd(lc.fc1Out.data, lc.geluOut.data, cint(S * ffnMul * n))
 
     var mlpOut = trackedCreate(S * n)
-    gpuSgemm(2, S, n, ffnMul * n, lc.reluOut, layer.fc2, mlpOut)
+    gpuSgemm(2, S, n, ffnMul * n, lc.geluOut, layer.fc2, mlpOut)
 
-    # Residual 2
+    # Residual 2: x = x2 + mlpOut
     let xNew = trackedCreate(S * n)
-    gpu_add(lc.xResidual2.data, mlpOut.data, xNew.data, cint(S * n))
+    gpu_add(lc.x2.data, mlpOut.data, xNew.data, cint(S * n))
     x = xNew
 
     cache.layerCaches.add(lc)
@@ -307,7 +292,7 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     # MLP backward: fc2
     let dReluOut = trackedCreate(S * ffnMul * n)
     gpuSgemm(1, S, ffnMul * n, n, dMlpOut, layer.fc2, dReluOut)
-    gpuSgemm(5, n, ffnMul * n, S, dMlpOut, lc.reluOut, m.layers[li].dfc2)
+    gpuSgemm(5, n, ffnMul * n, S, dMlpOut, lc.geluOut, m.layers[li].dfc2)
 
     # GELU backward
     let dFc1Out = trackedCreate(S * ffnMul * n)
@@ -320,7 +305,7 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 
     # RMSNorm 2 backward
     let dResid2 = trackedCreate(S * n)
-    gpu_rmsnorm_affine_bwd(lc.xInput2.data, layer.ln2g.data, dNorm2.data,
+    gpu_rmsnorm_affine_bwd(lc.x2.data, layer.ln2g.data, dNorm2.data,
                            lc.rms2.data, dResid2.data, m.layers[li].dln2g.data,
                            cint(S), cint(n))
     # Add residual gradient
@@ -380,7 +365,7 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 
     # RMSNorm 1 backward
     let dResid1 = trackedCreate(S * n)
-    gpu_rmsnorm_affine_bwd(lc.xInput1.data, layer.ln1g.data, dNorm1.data,
+    gpu_rmsnorm_affine_bwd(lc.x1.data, layer.ln1g.data, dNorm1.data,
                            lc.rms1.data, dResid1.data, m.layers[li].dln1g.data,
                            cint(S), cint(n))
 
