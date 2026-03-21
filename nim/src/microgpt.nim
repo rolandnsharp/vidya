@@ -12,11 +12,11 @@ import std/[math, random, strformat, os, streams, times]
 # ── Configuration ─────────────────────────────────────────────────
 
 const
-  nLayer   = 4
-  nEmbd    = 256
-  nHead    = 4
+  nLayer   = 8
+  nEmbd    = 512
+  nHead    = 8
   headDim  = nEmbd div nHead  # 64
-  blockSize = 256
+  blockSize = 512
   ffnMul   = 4
 
 # ── Model ─────────────────────────────────────────────────────────
@@ -586,6 +586,8 @@ when isMainModule:
         chk(cache.layerCaches[li].q, "L" & $li & ".q")
         chk(cache.layerCaches[li].k, "L" & $li & ".k")
         chk(cache.layerCaches[li].v, "L" & $li & ".v")
+        for hi in 0 ..< nHead:
+          chk(cache.layerCaches[li].attnWeights[hi], "L" & $li & ".attnW[" & $hi & "]")
         chk(cache.layerCaches[li].attnOut, "L" & $li & ".attnOut")
         chk(cache.layerCaches[li].xInput2, "L" & $li & ".xInput2")
         chk(cache.layerCaches[li].xNorm2, "L" & $li & ".xNorm2")
@@ -647,6 +649,17 @@ when isMainModule:
     clipGradNorm(gradPtrs, gradSizes, 1.0f)
 
     adamUpdate(m, adam, lr, optStep, beta2 = 0.9999f, wd = 0.0f)
+
+    # Check weights for NaN/inf periodically
+    if optStep mod 100 == 0:
+      proc chkW(buf: GpuBuf, name: string) =
+        let d = gpuDownload(buf)
+        for i in 0 ..< min(d.len, 1000):
+          if d[i] != d[i]: echo "  WEIGHT NaN: ", name; return
+          if d[i] > 1e6 or d[i] < -1e6: echo "  WEIGHT HUGE: ", name, "=", d[i]; return
+      chkW(m.wte, "wte"); chkW(m.wpe, "wpe"); chkW(m.lmHead, "lmHead")
+      for i in 0 ..< m.layers.len:
+        chkW(m.layers[i].wq, "L" & $i & ".wq"); chkW(m.layers[i].wk, "L" & $i & ".wk")
     zeroGrads(m)
     microStep = 0
     optStep += 1
