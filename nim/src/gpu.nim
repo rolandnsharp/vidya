@@ -234,6 +234,29 @@ proc gpu_zero_upper*(data: pointer, seq_len: cint)
   {.importc, cdecl.}
 proc gpu_clamp*(data: pointer, minv, maxv: cfloat, n: cint)
   {.importc, cdecl.}
+
+# Non-affine RMSNorm: just normalize, no gamma. Uses affine kernel with ones.
+var rmsnormOnes: GpuBuf
+var rmsnormOnesSize = 0
+
+proc gpu_rmsnorm_forward*(x, y, rms: pointer, rows, dim: cint) =
+  ## RMSNorm without learnable gamma. Creates a shared ones buffer.
+  if rmsnormOnesSize < dim.int:
+    var ones = newSeq[float32](dim.int)
+    for i in 0 ..< dim.int: ones[i] = 1.0f
+    rmsnormOnes = toGpu(ones)
+    rmsnormOnesSize = dim.int
+  gpu_rmsnorm_affine_fwd(x, rmsnormOnes.data, y, rms, rows, dim)
+
+proc gpu_rmsnorm_backward*(x_normed, dy, rms, dx: pointer, rows, dim: cint) =
+  ## RMSNorm backward without gamma.
+  if rmsnormOnesSize < dim.int:
+    var ones = newSeq[float32](dim.int)
+    for i in 0 ..< dim.int: ones[i] = 1.0f
+    rmsnormOnes = toGpu(ones)
+    rmsnormOnesSize = dim.int
+  var dummy = gpuCreate(dim.int)  # dgamma — discarded
+  gpu_rmsnorm_affine_bwd(x_normed, rmsnormOnes.data, dy, rms, dx, dummy.data, rows, dim)
 proc gpu_log_softmax*(x, y: pointer, rows, cols: cint)
   {.importc, cdecl.}
 proc gpu_cross_entropy_loss*(log_probs: pointer, target, vocab: cint): cfloat
