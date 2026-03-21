@@ -40,9 +40,12 @@ manage memory — the model figures out what matters.
 not context stuffing — actual learning. The knowledge is in the model,
 not a search index.
 
-**Grows.** Start at 4M parameters on a laptop GPU. Scale to 28M, 100M,
-1B by widening layers and adding depth. The same code, the same binary,
-just bigger numbers.
+**Grows with you.** Start at 4M parameters on a laptop GPU. Train it.
+Talk to it. When it plateaus, scale up — widen the layers, add depth.
+The model grows incrementally with your hardware and your data. 4M → 28M
+→ 100M → 1B. Same code, same binary, just bigger numbers in the config.
+You never need a datacenter because you never train from scratch at
+full size — you grow into it.
 
 ## The Stack
 
