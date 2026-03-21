@@ -1,26 +1,67 @@
 # NimLLM
 
-A local language model you own. Train from scratch on your data, chat with it,
-it retrains on your conversations and remembers.
+A grockable language model. No black boxes except the matrix multiplier.
 
-One Nim binary. No Python. No PyTorch. Runs on NVIDIA (CUDA) today,
-[Tenstorrent Blackhole](https://tenstorrent.com) (TT-Metalium) tomorrow.
-Nim compiles to C and C++ — swap one file to target different silicon.
+One binary that grows with you. Feed it books. Talk to it. It learns from
+your answers. Feed it your Claude Code logs. It learns how you think.
 
-## Usage
-
-```bash
-nimllm train data.txt          # train on a text file
-nimllm train --resume          # continue from last checkpoint
-nimllm chat                    # talk to it (retrains on every exchange)
-nimllm read notes.md           # read a document into the weights
-nimllm code                    # agent mode — runs shell commands
+```
+nimllm train data.txt          # train on text
+nimllm chat                    # talk to it — it retrains on every exchange
+nimllm read book.txt           # absorb a book into the weights
+nimllm code                    # agent mode — uses your shell tools
 ```
 
-Every conversation is training data. Important things stick — facts that
-activate strong gradients survive. Small talk fades — weak gradients get
-pulled back to baseline by elastic weight consolidation. You don't manage
-memory. You just talk. The model figures out what matters.
+## Why
+
+Every other LLM is a black box. Billions of parameters trained on data
+you never saw, running on code you can't read, behind an API you don't
+control.
+
+NimLLM is ~600 lines of Nim + ~300 lines of CUDA. You can read every
+line. The only thing you can't fully see into is `cublasSgemm` — the
+matrix multiplier. Everything else — attention, activation functions,
+normalization, the optimizer, the backward pass — is code you wrote
+and can change.
+
+The model starts small. You train it on what matters to you. It
+remembers your conversations. It grows as you feed it more.
+
+## What It Does
+
+**Trains from scratch.** No downloading someone else's weights. You
+choose the data. You own the model.
+
+**Remembers.** Every conversation retrains the model. Important things
+stick through selective weight updates. Small talk fades. You don't
+manage memory — the model figures out what matters.
+
+**Reads.** `nimllm read` absorbs a document into the weights. Not RAG,
+not context stuffing — actual learning. The knowledge is in the model,
+not a search index.
+
+**Grows.** Start at 4M parameters on a laptop GPU. Scale to 28M, 100M,
+1B by widening layers and adding depth. The same code, the same binary,
+just bigger numbers.
+
+## The Stack
+
+```
+Your text
+  ↓
+BPE tokenizer (trained on your corpus)
+  ↓
+Nim (model, forward, backward, optimizer)
+  ↓
+Flash attention kernel (numerically stable, fused)
+  ↓
+cuBLAS sgemm (matrix multiply — the one black box)
+  ↓
+Your GPU
+```
+
+No PyTorch. No Python. No frameworks. Nim compiles to C. C calls CUDA.
+The binary is 4MB.
 
 ## Quick Start
 
@@ -29,135 +70,90 @@ memory. You just talk. The model figures out what matters.
 curl https://nim-lang.org/choosenim/init.sh -sSf | sh
 export PATH=$HOME/.nimble/bin:$PATH
 
-# Clone and build
+# Build
 git clone https://github.com/rolandnsharp/vidya.git
-cd vidya/nim
+cd vidya/nim/src
+nvcc -c -O2 -Xcompiler -fPIC -o kernels.o kernels.cu
+cd ..
+nim c -d:release src/microgpt.nim
 
-# Compile CUDA kernels
-cd src && nvcc -c -O2 -Xcompiler -fPIC -o kernels.o kernels.cu && cd ..
-
-# Build the trainer
-nim c -d:release src/ag_train.nim
-
-# Train on your data (one conversation per line)
-./src/ag_train
+# Train
+./src/microgpt
 ```
-
-## Training Data
-
-Put your training text in `chat_input.txt` at the repo root. One conversation
-per line. Use `<|user|>` and `<|assistant|>` markers:
-
-```
-<|user|> Hello, how are you? <|assistant|> I'm doing well, thanks for asking.
-<|user|> Tell me about Nim. <|assistant|> Nim is a language that compiles to C.
-```
-
-The tokenizer trains automatically on your data the first run.
-
-## What You Need
-
-- An NVIDIA GPU with CUDA installed (any card with 2+ GB VRAM works)
-- Nim 2.0+ (`choosenim` handles this)
-- ~400 MB disk per checkpoint
-
-## Customise for Your Machine
-
-Ask Claude Code to optimise the model for your hardware:
-
-> "I have an RTX 4090 with 24GB VRAM. Resize the model to use most of it."
-
-The key parameters are in `src/gpu_model.nim`:
-
-```nim
-const
-  nLayer   = 8      # more layers = deeper reasoning, slower training
-  nEmbd    = 1024   # wider = more capacity per layer
-  nHead    = 16     # more heads = more attention patterns
-  headDim  = 64     # nEmbd / nHead — keep at 64 for best results
-  blockSize = 512   # context window in tokens
-```
-
-**Scaling guide:**
-
-| GPU VRAM | nEmbd | nLayer | Params | Training speed |
-|----------|-------|--------|--------|----------------|
-| 2 GB     | 512   | 6      | ~20M   | ~20 steps/s    |
-| 4 GB     | 768   | 6      | ~50M   | ~15 steps/s    |
-| 8 GB     | 768   | 8      | ~70M   | ~12 steps/s    |
-| 12 GB    | 1024  | 8      | ~103M  | ~7 steps/s     |
-| 24 GB    | 1536  | 12     | ~350M  | ~3 steps/s     |
-
-Keep `headDim = 64` (change `nHead` to match `nEmbd / 64`).
-
-Training hyperparameters are in `src/ag_train.nim`:
-
-```nim
-const
-  learningRate = 0.0001    # lower for larger models
-  warmupSteps = 2000       # longer for more data
-  weightDecay = 0.1        # keep this, prevents explosion
-```
-
-## Checkpoints
-
-The model saves every 2500 steps to `nimllm_2500.bin`, `nimllm_5000.bin`, etc.
-Also saves `nimllm_latest.bin` for easy resume. Restart and it picks up where
-it left off.
 
 ## Architecture
 
-103M parameter GPT-2 style transformer. Wide and shallow for memory
-experiments.
+GPT-2 style transformer with flash attention.
 
-- 8 transformer layers with pre-norm (RMSNorm)
-- Multi-head attention with rotary position embeddings (RoPE)
-- GELU activation in feed-forward layers
-- Weight-tied embedding/output projection
-- BPE tokenizer trained on your corpus
-- AdamW optimizer with cosine LR decay and gradient clipping
+| | Default | Scale up |
+|---|---|---|
+| Parameters | 28M | 100M+ |
+| Layers | 8 | 12+ |
+| Dimension | 512 | 1024+ |
+| Heads | 8 | 16+ |
+| Context | 512 | 1024+ |
+| Attention | Flash (fused, numerically stable) | Same |
+| Activation | GELU | SwiGLU (kernel ready) |
+| Norm | RMSNorm with learnable gamma | Same |
+| Optimizer | AdamW | Same |
+| Precision | float32 | Same |
 
-The entire stack: ~1,000 lines of Nim + ~300 lines of CUDA.
+Flash attention makes overflow impossible — the online softmax never
+computes `exp(large_number)`. This is what fixed the float32 numerical
+stability issue that took two days to debug.
+
+## Feed It Your Claude Code Logs
+
+Claude Code stores conversations as JSONL. NimLLM can train on them:
+
+```bash
+# Convert Claude logs to training format
+cat ~/.claude/logs/*.jsonl | jq -r '.messages[] | "<|" + .role + "|> " + .content' > claude_convos.txt
+nimllm train claude_convos.txt
+```
+
+The model learns your coding patterns, your architecture preferences,
+your problem-solving approach. It becomes a reflection of how you work.
+
+## Customise
+
+The model constants are at the top of `microgpt.nim`:
+
+```nim
+const
+  nLayer   = 8       # more layers = deeper reasoning
+  nEmbd    = 512     # wider = more capacity per layer
+  nHead    = 8       # more heads = more attention patterns
+  headDim  = 64      # keep at 64
+  blockSize = 512    # context window in tokens
+  ffnMul   = 4       # FFN width multiplier
+```
+
+Change, recompile, retrain. Everything is explicit.
+
+## Hardware Portability
+
+Nim compiles to C (NVIDIA/CUDA) and C++ (Tenstorrent/TT-Metalium).
+The model, tokenizer, and training loop are hardware-agnostic. Only
+`gpu.nim` and `kernels.cu` touch the hardware.
 
 ## Files
 
 ```
 src/
-  ag_train.nim      — training loop (forward + backward + Adam)
-  ag_forward.nim    — autograd-aware forward pass
-  autograd.nim      — reverse-mode automatic differentiation
-  gpu_model.nim     — model definition, weights on GPU
-  gpu.nim           — CUDA bindings (cuBLAS, memory, kernels)
-  kernels.cu        — CUDA kernels (GELU, RMSNorm, softmax, RoPE, Adam)
-  bpe.nim           — BPE tokenizer
-  gpu_forward.nim   — forward-only pass (no autograd, 94 steps/s)
-  grad_check.nim    — numerical gradient verification
+  microgpt.nim       # the whole thing: model, forward, backward, training
+  gpu.nim            # CUDA bindings and GPU memory management
+  kernels.cu         # CUDA kernels: flash attention, GELU, RMSNorm, Adam
+  bpe.nim            # BPE tokenizer
+  autograd.nim       # tracked allocation helpers (no autograd graph used)
 ```
+
+~600 lines of Nim. ~300 lines of CUDA. That's the entire LLM.
 
 ## Status
 
-Training stably at loss 4.7 (from 9.4 at start). Gradient norms healthy at
-3-9. Not yet conversational — needs loss ~3.5 to form coherent sentences.
-
-## Hardware Portability
-
-Nim compiles to C (for CUDA/NVIDIA) and C++ (for TT-Metalium/Tenstorrent).
-The model, autograd, tokenizer, and training loop are hardware-agnostic. Only
-`gpu.nim` and `kernels.cu` touch the hardware. To port to Blackhole:
-
-```
-gpu.nim      → replace cuBLAS calls with TT-NN calls
-kernels.cu   → rewrite as TT-Metalium kernels (or run on Tensix RISC-V cores)
-```
-
-Everything else stays the same. One model definition, any silicon.
-
-## Why Nim
-
-Nim compiles to C. CUDA interop is just C function calls — no FFI bridge, no
-GC issues, no build system hacks. You get Python's readability with C's
-performance. The GPU layer is 200 lines. The autograd is 200 lines. PyTorch
-is 3 million lines.
+Training stably at loss 5.0 on 37K conversations. 28M parameters.
+Flash attention forward and backward. No NaN at any learning rate.
 
 ## License
 
